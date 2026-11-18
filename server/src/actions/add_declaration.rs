@@ -51,8 +51,8 @@ pub(crate) fn definition_at(tree: &SymbolTree, offset: usize) -> Option<SymbolPa
     })
 }
 
-/// Whether the definition at `offset` is inside a class body (an inline member definition).
-fn in_class_body(symbol: &Symbol) -> bool {
+/// Whether a definition is inside a class body (an inline member definition).
+pub(crate) fn in_class_body(symbol: &Symbol) -> bool {
     symbol
         .parent_scope()
         .is_some_and(|s| s.kind == ScopeKind::Class)

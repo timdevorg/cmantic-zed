@@ -4,6 +4,7 @@ pub mod accessors;
 pub mod add_declaration;
 pub mod add_definition;
 pub mod member;
+pub mod move_definition;
 pub mod operators;
 
 use tower_lsp_server::ls_types::Position;

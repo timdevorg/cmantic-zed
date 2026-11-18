@@ -85,6 +85,10 @@ pub struct FunctionInfo {
     pub default_args: Vec<Range<usize>>,
     /// Normalized parameter types, used to match declarations with definitions.
     pub param_types: Vec<String>,
+    /// Each parameter declaration, without its default argument (empty for `(void)`).
+    pub param_ranges: Vec<Range<usize>>,
+    /// Each parameter's name (empty if unnamed), parallel to `param_ranges`.
+    pub param_names: Vec<String>,
     pub is_const: bool,
     pub ref_qualifier: String,
     pub body: FunctionBody,
@@ -1032,7 +1036,12 @@ impl<'t> Collector<'t> {
             }
         }
 
-        let (param_types, default_args) = self.parameters(params);
+        let Parameters {
+            types: param_types,
+            defaults: default_args,
+            ranges: param_ranges,
+            names: param_names,
+        } = self.parameters(params);
 
         let body = match node.kind() {
             "function_definition" => {
@@ -1069,6 +1078,8 @@ impl<'t> Collector<'t> {
             params: params.byte_range(),
             default_args,
             param_types,
+            param_ranges,
+            param_names,
             is_const,
             ref_qualifier,
             body,
@@ -1079,10 +1090,12 @@ impl<'t> Collector<'t> {
         })
     }
 
-    /// Normalized parameter types and the ranges of default arguments.
-    fn parameters(&self, params: Node) -> (Vec<String>, Vec<Range<usize>>) {
+    /// Normalized parameter types, default argument ranges, parameter ranges and names.
+    fn parameters(&self, params: Node) -> Parameters {
         let mut types = Vec::new();
         let mut defaults = Vec::new();
+        let mut ranges = Vec::new();
+        let mut names = Vec::new();
         let mut cursor = params.walk();
         for param in params.children(&mut cursor) {
             match param.kind() {
@@ -1096,6 +1109,7 @@ impl<'t> Collector<'t> {
                         defaults.push(range);
                     }
                     let mut text = String::new();
+                    ranges.push(param.start_byte()..self.text[..end].trim_end().len());
                     match param
                         .child_by_field_name("declarator")
                         .and_then(innermost_identifier)
@@ -1104,8 +1118,12 @@ impl<'t> Collector<'t> {
                             text.push_str(&self.text[param.start_byte()..id.start_byte()]);
                             text.push(' ');
                             text.push_str(&self.text[id.end_byte()..end]);
+                            names.push(self.node_text(id).to_string());
                         }
-                        _ => text.push_str(&self.text[param.start_byte()..end]),
+                        _ => {
+                            text.push_str(&self.text[param.start_byte()..end]);
+                            names.push(String::new());
+                        }
                     }
                     types.push(normalize_type(&text));
                 }
@@ -1114,9 +1132,23 @@ impl<'t> Collector<'t> {
         }
         if types.len() == 1 && types[0] == "void" {
             types.clear();
+            ranges.clear();
+            names.clear();
         }
-        (types, defaults)
+        Parameters {
+            types,
+            defaults,
+            ranges,
+            names,
+        }
     }
+}
+
+struct Parameters {
+    types: Vec<String>,
+    defaults: Vec<Range<usize>>,
+    ranges: Vec<Range<usize>>,
+    names: Vec<String>,
 }
 
 /// Removes `prefix` from the start of every line after the first.

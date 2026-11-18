@@ -3,8 +3,8 @@
 C/C++ refactorings for [Zed](https://zed.dev), ported from the
 [C-Mantic](https://github.com/BigBahss/vscode-cmantic) VS Code extension.
 
-> **Status: early development.** Add Definition, Add Declaration, Generate Getters and
-> Setters and Generate Operators are implemented; the other refactorings are still being ported.
+> **Status: early development.** Add Definition, Add Declaration, Move Definition,
+> Generate Getters and Setters and Generate Operators are implemented; the other refactorings are still being ported.
 
 ## How it works
 
@@ -26,7 +26,7 @@ The Zed extension downloads `cmantic-ls` from this repo's GitHub releases and st
 | Generate Getters and Setters | done |
 | Generate equality, relational and stream output operators | done (all operands, inline) |
 | Add Header Guard, Add Include, Create Matching Source File | planned |
-| Move Definition | planned |
+| Move Definition (matching source/header file, into/out of class) | done |
 | Update Function Signature | planned |
 
 Switch Header/Source is already provided by Zed and clangd.
@@ -149,6 +149,49 @@ Differences from C-Mantic:
   where it doesn't help.
 - Offered on the whole head of the definition, not only its name.
 
+## Move Definition
+
+Put the cursor on the head of a function definition (not its body):
+
+- **Move Definition to matching source file** (in a header): moves the definition to the
+  source file, next to the definitions of neighbouring declarations like Add Definition.
+  An in-class definition, or a free function without a separate declaration, leaves its
+  declaration behind (the head as written, with default arguments). `inline` is dropped.
+- **Move Definition to matching header file** (in a source file): moves the definition to the
+  header next to its declaration's neighbours, adding `inline`. Offered when the declaration
+  is in the header, or for a free function without one.
+- **Move Definition into class "Foo"** (or `struct`): an out-of-class member definition replaces
+  its declaration in the class (in this file or the matching header): the declaration's head
+  (keeping `virtual`, default arguments, ...) with the definition's body. Without a
+  declaration, the whole definition goes into the public section.
+- **Move Definition below class body** (or `struct`): an in-class definition leaves its
+  declaration in the class and goes below the class with `Foo::` and, in a header, `inline`.
+
+The body is kept as it is, re-indented for its new place; scope qualifiers are added or
+dropped as needed (`namespace` blocks and qualified names both work), template statements of
+class templates are added when moving out of the class. Leading comments move with the
+definition. When a declaration is left behind, `alwaysMoveComments: false` keeps them with
+the declaration instead. Moving to another file opens it at the moved definition
+(`revealNewDefinition`).
+
+Not offered to the source file for `inline` functions (unless only the definition says
+`inline`), `constexpr`, `consteval`, templates and members of class templates, `static` free
+functions and functions in an anonymous namespace; not offered to the header for a definition
+whose declaration is in the source file itself. Into/out of class only in C++, and not for
+anonymous classes or friends defined in class templates.
+
+Differences from C-Mantic:
+
+- Moving into the class keeps the definition's parameter names when the declaration's differ
+  (or are missing), since the body uses them. Both leading comments are kept when the
+  declaration and the definition have one (C-Mantic drops the definition's).
+- When a deleted definition's comment would not be moved (`alwaysMoveComments: false` but no
+  declaration left behind), it is moved anyway instead of being lost.
+- For a member without a declaration, C-Mantic asks for the access specifier; this port uses
+  `public` (next to a neighbour's declaration when possible).
+- Titles say "matching source/header file" instead of the file name. Moving a definition of a
+  class declared in a source file to the header is not offered.
+
 ## Generate Getters and Setters
 
 Put the cursor on a member variable of a class or struct (in C++ files) to get:
@@ -266,7 +309,8 @@ Server settings go under `lsp.cmantic.settings` (the same keys are accepted in
         },
         "c": { "curlyBraceFormat": { "function": "newLine" } },
         "caseStyle": "camelCase",
-        "revealNewDefinition": true
+        "revealNewDefinition": true,
+        "alwaysMoveComments": true
       }
     }
   }
@@ -283,7 +327,8 @@ Server settings go under `lsp.cmantic.settings` (the same keys are accepted in
 | `cpp.useExplicitThisPointer` | Write `this->member` in generated member functions (getters, setters, operators). |
 | `cpp.friendComparisonOperators` | Generate comparison operators as `friend` functions taking `lhs` and `rhs` instead of member functions. |
 | `caseStyle` | Naming of generated getters and setters: `"camelCase"`, `"snake_case"` or `"PascalCase"`. |
-| `revealNewDefinition` | After adding a definition to the matching source file, or adding all missing definitions, open the file with the cursor in the (first) new body. Also used for getters/setters defined in the matching source file. |
+| `revealNewDefinition` | After adding a definition to the matching source file, or adding all missing definitions, open the file with the cursor in the (first) new body. Also used for getters/setters defined in the matching source file, and to open the file a definition was moved to. |
+| `alwaysMoveComments` | Move Definition moves leading comments with the definition even when a declaration is left behind. When `false`, they stay with the declaration. |
 
 Indentation is detected from the file being edited, from the lines that follow a `{`, an access
 specifier or a case label (so aligned initializer lists and parameter lists are ignored). If the

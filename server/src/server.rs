@@ -14,6 +14,7 @@ use crate::actions::accessors::{self, AccessorKind};
 use crate::actions::add_declaration::{self, DeclarationTarget};
 use crate::actions::add_definition::{self, BulkTarget, FileInput, Initializers, Target};
 use crate::actions::member::GeneratedEdit;
+use crate::actions::move_definition::{self, MoveTarget};
 use crate::actions::operators;
 use crate::config::Config;
 use crate::document::Document;
@@ -38,6 +39,30 @@ pub mod action_id {
     pub const GENERATE_SETTER: &str = "generateSetter";
     pub const ADD_DECLARATION_MATCHING_HEADER: &str = "addDeclaration.matchingHeader";
     pub const ADD_DECLARATION_CLASS: &str = "addDeclaration.class";
+    pub const MOVE_DEFINITION_MATCHING_SOURCE: &str = "moveDefinition.matchingSource";
+    pub const MOVE_DEFINITION_MATCHING_HEADER: &str = "moveDefinition.matchingHeader";
+    pub const MOVE_DEFINITION_INTO_CLASS: &str = "moveDefinition.intoClass";
+    pub const MOVE_DEFINITION_OUT_OF_CLASS: &str = "moveDefinition.outOfClass";
+}
+
+fn move_action_id(target: MoveTarget) -> &'static str {
+    match target {
+        MoveTarget::MatchingSource => action_id::MOVE_DEFINITION_MATCHING_SOURCE,
+        MoveTarget::MatchingHeader => action_id::MOVE_DEFINITION_MATCHING_HEADER,
+        MoveTarget::IntoClass => action_id::MOVE_DEFINITION_INTO_CLASS,
+        MoveTarget::OutOfClass => action_id::MOVE_DEFINITION_OUT_OF_CLASS,
+    }
+}
+
+fn move_target(action: &str) -> Option<MoveTarget> {
+    [
+        MoveTarget::MatchingSource,
+        MoveTarget::MatchingHeader,
+        MoveTarget::IntoClass,
+        MoveTarget::OutOfClass,
+    ]
+    .into_iter()
+    .find(|&t| move_action_id(t) == action)
 }
 
 fn declaration_action_id(target: DeclarationTarget) -> &'static str {
@@ -174,8 +199,12 @@ impl Backend {
             action_id::ADD_DEFINITION_MATCHING_SOURCE
                 | action_id::CONSTRUCTOR_MATCHING_SOURCE
                 | action_id::ADD_DEFINITIONS_MATCHING_SOURCE
+                | action_id::MOVE_DEFINITION_MATCHING_SOURCE
         );
-        let needs_header = args.action == action_id::ADD_DECLARATION_MATCHING_HEADER;
+        let needs_header = matches!(
+            args.action.as_str(),
+            action_id::ADD_DECLARATION_MATCHING_HEADER | action_id::MOVE_DEFINITION_MATCHING_HEADER
+        );
         if needs_source && source.is_none() || needs_header && header.is_none() {
             let kind = if needs_header { "header" } else { "source" };
             self.show_warning(&format!("No matching {kind} file was found."))
@@ -247,6 +276,21 @@ impl Backend {
                     &config,
                 ) else {
                     self.show_info("No undeclared function definition at the cursor.")
+                        .await;
+                    return Ok(None);
+                };
+                add_generated(&mut changes, generated, &args.uri, other_uri.as_ref())
+            }
+            action if move_target(action).is_some() => {
+                let target = move_target(action).expect("checked");
+                let Some(generated) = move_definition::move_definition(
+                    &decl,
+                    args.position,
+                    target,
+                    other.as_ref(),
+                    &config,
+                ) else {
+                    self.show_info("The definition at the cursor can't be moved there.")
                         .await;
                     return Ok(None);
                 };
@@ -582,6 +626,19 @@ impl LanguageServer for Backend {
                 position,
                 action.target,
                 header.as_ref(),
+                &config,
+            ) {
+                actions.push(edit_action(&action.title, generated.edits));
+            }
+        }
+        for action in move_definition::available_moves(&decl, position, other.as_ref()) {
+            if action.edits_other_file {
+                actions.push(command_action(&action.title, move_action_id(action.target)));
+            } else if let Some(generated) = move_definition::move_definition(
+                &decl,
+                position,
+                action.target,
+                other.as_ref(),
                 &config,
             ) {
                 actions.push(edit_action(&action.title, generated.edits));

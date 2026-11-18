@@ -113,6 +113,8 @@ pub struct Config {
     pub reveal_new_definition: bool,
     /// Naming style of generated getters and setters.
     pub case_style: CaseStyle,
+    /// Move Definition moves leading comments even when a declaration is left behind.
+    pub always_move_comments: bool,
 }
 
 impl Default for Config {
@@ -129,6 +131,7 @@ impl Default for Config {
             },
             reveal_new_definition: true,
             case_style: CaseStyle::CamelCase,
+            always_move_comments: true,
         }
     }
 }
@@ -197,6 +200,11 @@ impl Config {
             "/revealNewDefinition",
         );
         set(&mut config.case_style, value, "/caseStyle");
+        set(
+            &mut config.always_move_comments,
+            value,
+            "/alwaysMoveComments",
+        );
         for (settings, lang) in [(&mut config.cpp, "cpp"), (&mut config.c, "c")] {
             set(
                 &mut settings.curly_brace_format.function,
@@ -279,6 +287,7 @@ mod tests {
             CurlyBraceFormat::NewLine
         );
         assert!(config.reveal_new_definition);
+        assert!(config.always_move_comments);
         assert!(config.is_header("/a/b.hpp"));
         assert!(config.is_source("/a/b.cc"));
         assert!(!config.is_header("/a/b.cc"));
@@ -289,6 +298,7 @@ mod tests {
         let config = Config::from_value(&json!({
             "headerExtensions": ["h"],
             "revealNewDefinition": false,
+            "alwaysMoveComments": false,
             "cpp": { "curlyBraceFormat": { "function": "sameLine" }, "bracedInitialization": true }
         }));
         assert!(config.cpp.braced_initialization);
@@ -303,6 +313,10 @@ mod tests {
             CurlyBraceFormat::NewLine
         );
         assert!(!config.reveal_new_definition);
+        assert!(!config.always_move_comments);
+        // Also when another value is invalid.
+        let config = Config::from_value(&json!({ "alwaysMoveComments": false, "caseStyle": 3 }));
+        assert!(!config.always_move_comments);
     }
 
     #[test]

@@ -44,6 +44,11 @@ Port of the C-Mantic VS Code extension to Zed, as a language server plus a thin 
   - `add_definition::format_head` formats any function head (declaration or definition, `HeadKind`) for a
     target position given the target's enclosing scopes; explicit qualifiers (`Foo<T>::`) count as
     scopes, so qualifiers the target is inside are dropped and their template statements with them.
+  - `actions/move_definition.rs`: Move Definition (`moveDefinition.ts`): to the matching source/header
+    file, into the class (`combineDefinition`, keeping the definition's parameter names via
+    `FunctionInfo::param_ranges`/`param_names`; or via `ClassEditor::replace` + `add` without a
+    declaration) and below the class. Bodies are copied and re-indented (`dedent_lines`), deletion
+    removes whole lines plus one blank line (`deletion_range`).
   - `actions/accessors.rs`: Generate Getter/Setter (`Accessor.ts`, naming from `CSymbol.ts`), built on
     `ClassEditor`. Types judged by syntax only (`VariableInfo::leading_text`).
   - `actions/operators.rs`: Generate Equality / Relational / Stream Output Operators (`Operator.ts`),
@@ -54,7 +59,7 @@ Port of the C-Mantic VS Code extension to Zed, as a language server plus a thin 
     recomputes the action (with `matching_file`: the source of a header or the header of a source
     file), sends `workspace/applyEdit`, then `window/showDocument` (one applyEdit may change the header and its source file). The older
     `cmantic.addDefinitionInSourceFile` is still accepted. Same-file single edits carry an `edit`.
-  - Tests: `server/tests/add_definition.rs`, `add_definitions.rs`, `add_declaration.rs`, `accessors.rs`, `operators.rs` (fixtures, `@` = cursor, plus an
+  - Tests: `server/tests/add_definition.rs`, `add_definitions.rs`, `add_declaration.rs`, `move_definition.rs`, `accessors.rs`, `operators.rs` (fixtures, `@` = cursor, plus an
     every-offset no-panic test), `header_source.rs` (temp dirs), `lsp.rs` (end-to-end through
     `LspService`; `Harness` sets up a temp project and a fake client that records applyEdit/showDocument).
 - `reference/vscode-cmantic/`: original C-Mantic TypeScript source (MIT). Git-ignored, read-only reference.

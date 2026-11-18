@@ -209,6 +209,15 @@ impl<'a> ClassEditor<'a> {
         Some(())
     }
 
+    /// Replaces `range` (byte offsets into the current text, outside the class) with `text`,
+    /// e.g. to remove a definition that is moved into the class.
+    pub fn replace(&mut self, range: std::ops::Range<usize>, text: &str) {
+        if range.end <= self.class_start {
+            self.class_start = self.class_start - range.len() + text.len();
+        }
+        self.buffer.replace(range, text);
+    }
+
     pub fn finish(self) -> GeneratedEdit {
         let (other_edits, other_cursor) = match &self.source {
             Some((_, buffer, _)) if buffer.is_changed() => (

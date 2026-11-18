@@ -661,7 +661,13 @@ async fn add_declaration_in_class_and_matching_header() {
     h.open("foo.cpp").await;
     // Member definition: into the class in the header (a command).
     let actions = h.actions("foo.cpp", 4, 9).await;
-    assert_eq!(titles(&actions), vec!["Add Declaration in class \"Foo\""]);
+    assert_eq!(
+        titles(&actions),
+        vec![
+            "Add Declaration in class \"Foo\"",
+            "Move Definition into class \"Foo\""
+        ]
+    );
     let sent = h.run(&actions[0]).await;
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert_eq!(sent[0].0, "workspace/applyEdit");
@@ -680,7 +686,8 @@ async fn add_declaration_in_class_and_matching_header() {
         titles(&actions),
         vec![
             "Add Declaration in matching header file",
-            "Add Declaration in this file"
+            "Add Declaration in this file",
+            "Move Definition to matching header file"
         ]
     );
     let sent = h
@@ -696,10 +703,120 @@ async fn add_declaration_in_class_and_matching_header() {
         this_file["edit"]["changes"][&h.uri("foo.cpp")][0]["newText"],
         "void free_b();\n\n"
     );
-    // Declared already, or internal: nothing / only this file.
-    assert!(h.actions("foo.cpp", 6, 6).await.is_empty());
+    // Declared already, or internal: no Add Declaration / only this file.
+    assert_eq!(
+        titles(&h.actions("foo.cpp", 6, 6).await),
+        vec!["Move Definition to matching header file"]
+    );
     let actions = h.actions("foo.cpp", 10, 13).await;
     assert_eq!(titles(&actions), vec!["Add Declaration in this file"]);
     // Inside a body: nothing.
     assert!(h.actions("foo.cpp", 4, 30).await.is_empty());
+}
+
+const MOVE_HEADER: &str =
+    "#pragma once\n\nclass Foo {\npublic:\n    void a();\n    int b() const { return 1; }\n};\n";
+const MOVE_SOURCE: &str = "#include \"foo.h\"\n\nvoid Foo::a()\n{\n    x();\n}\n";
+
+#[tokio::test]
+async fn move_definition_between_files() {
+    let mut h = Harness::new(
+        "move-definition",
+        &[("foo.h", MOVE_HEADER), ("foo.cpp", MOVE_SOURCE)],
+    )
+    .await;
+    h.open("foo.h").await;
+    h.open("foo.cpp").await;
+    let header_uri = h.uri("foo.h");
+    let source_uri = h.uri("foo.cpp");
+
+    // In-class definition in the header.
+    let actions = h.actions("foo.h", 5, 9).await;
+    assert_eq!(
+        titles(&actions),
+        vec![
+            "Move Definition to matching source file",
+            "Move Definition below class body"
+        ]
+    );
+    let below = find(&actions, "Move Definition below class body");
+    assert!(below.get("command").is_none());
+    assert_eq!(
+        below["edit"]["changes"][&header_uri],
+        json!([
+            {
+                "range": { "start": { "line": 5, "character": 4 }, "end": { "line": 5, "character": 31 } },
+                "newText": "int b() const;"
+            },
+            {
+                "range": { "start": { "line": 6, "character": 2 }, "end": { "line": 6, "character": 2 } },
+                "newText": "\n\ninline int Foo::b() const { return 1; }"
+            }
+        ])
+    );
+    let sent = h
+        .run(find(&actions, "Move Definition to matching source file"))
+        .await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[0].0, "workspace/applyEdit");
+    let changes = &sent[0].1["edit"]["changes"];
+    assert_eq!(changes.as_object().unwrap().len(), 2);
+    assert_eq!(
+        changes[&header_uri],
+        json!([{
+            "range": { "start": { "line": 5, "character": 4 }, "end": { "line": 5, "character": 31 } },
+            "newText": "int b() const;"
+        }])
+    );
+    assert_eq!(
+        changes[&source_uri],
+        json!([{
+            "range": { "start": { "line": 5, "character": 1 }, "end": { "line": 5, "character": 1 } },
+            "newText": "\n\nint Foo::b() const { return 1; }"
+        }])
+    );
+    assert_eq!(sent[1].0, "window/showDocument");
+    assert_eq!(sent[1].1["uri"], json!(source_uri));
+    assert_eq!(
+        sent[1].1["selection"]["start"],
+        json!({ "line": 7, "character": 0 })
+    );
+
+    // Out-of-class definition in the source file.
+    let actions = h.actions("foo.cpp", 2, 11).await;
+    assert_eq!(
+        titles(&actions),
+        vec![
+            "Move Definition to matching header file",
+            "Move Definition into class \"Foo\""
+        ]
+    );
+    let sent = h
+        .run(find(&actions, "Move Definition into class \"Foo\""))
+        .await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let changes = &sent[0].1["edit"]["changes"];
+    assert_eq!(
+        changes[&header_uri],
+        json!([{
+            "range": { "start": { "line": 4, "character": 4 }, "end": { "line": 4, "character": 13 } },
+            "newText": "void a()\n    {\n        x();\n    }"
+        }])
+    );
+    assert_eq!(
+        changes[&source_uri],
+        json!([{
+            "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 6, "character": 0 } },
+            "newText": ""
+        }])
+    );
+    let sent = h
+        .run(find(&actions, "Move Definition to matching header file"))
+        .await;
+    assert_eq!(
+        sent[0].1["edit"]["changes"][&header_uri][0]["newText"],
+        "\n\ninline void Foo::a()\n{\n    x();\n}"
+    );
+    assert_eq!(sent[1].0, "window/showDocument");
+    assert_eq!(sent[1].1["uri"], json!(header_uri));
 }
