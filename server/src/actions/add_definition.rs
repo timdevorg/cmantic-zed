@@ -103,18 +103,18 @@ pub struct BulkEdit {
 
 /// The file a definition goes into.
 #[derive(Clone, Copy)]
-struct Destination<'a> {
-    file: &'a FileInput<'a>,
-    tree: &'a SymbolTree,
-    same_file: bool,
+pub(crate) struct Destination<'a> {
+    pub file: &'a FileInput<'a>,
+    pub tree: &'a SymbolTree,
+    pub same_file: bool,
 }
 
 /// A definition to insert, in byte offsets.
-struct DefinitionText {
-    offset: usize,
-    text: String,
+pub(crate) struct DefinitionText {
+    pub offset: usize,
+    pub text: String,
     /// Offset of the cursor inside `text`.
-    cursor: usize,
+    pub cursor: usize,
 }
 
 /// A single text edit plus where to put the cursor after applying it.
@@ -132,17 +132,6 @@ pub struct Insertion {
 pub fn has_declaration_at(decl: &FileInput, position: Position) -> bool {
     let tree = SymbolTree::new(decl.text);
     declaration_at(&tree, position_to_offset(decl.text, position)).is_some()
-}
-
-/// Cheap pre-check: whether the cursor is on a function declaration or a class head, where
-/// Add Definition / Add all missing definitions may be offered.
-pub fn may_offer_actions_at(decl: &FileInput, position: Position) -> bool {
-    let tree = SymbolTree::new(decl.text);
-    let offset = position_to_offset(decl.text, position);
-    tree.symbol_at(offset).is_some_and(|path| {
-        let symbol = path.symbol();
-        symbol.is_function_declaration() || is_on_class_head(symbol, offset)
-    })
 }
 
 /// Returns the Add Definition actions available for the function declaration at `position`.
@@ -279,21 +268,24 @@ fn can_define_in_source_file(text: &str, symbol: &Symbol) -> bool {
         && !symbol.has_unspecialized_template()
 }
 
-fn indent_unit(target: &str, decl: &str) -> String {
+pub(crate) fn indent_unit(target: &str, decl: &str) -> String {
     detect_indentation(target)
         .or_else(|| detect_indentation(decl))
         .unwrap_or_else(|| "    ".into())
 }
 
-fn body(on_new_line: bool, indentation: &str, unit: &str) -> String {
+/// A function body. `content` (may be empty) goes on the line after `{`, indented by `unit`;
+/// its continuation lines keep their own indentation relative to the function.
+fn body(on_new_line: bool, indentation: &str, unit: &str, content: &str) -> String {
+    let content = content.replace('\n', &format!("\n{indentation}"));
     if on_new_line {
-        format!("\n{indentation}{{\n{indentation}{unit}\n{indentation}}}")
+        format!("\n{indentation}{{\n{indentation}{unit}{content}\n{indentation}}}")
     } else {
-        format!(" {{\n{indentation}{unit}\n{indentation}}}")
+        format!(" {{\n{indentation}{unit}{content}\n{indentation}}}")
     }
 }
 
-fn with_eol(text: String, eol: &str) -> String {
+pub(crate) fn with_eol(text: String, eol: &str) -> String {
     if eol == "\n" {
         text
     } else {
@@ -321,7 +313,7 @@ fn inline_definition(
         .brace_on_new_line(func.is_constructor || func.is_destructor);
     let init_list = initializer_list(path, initializers, &unit, config)
         .replace('\n', &format!("\n{indentation}"));
-    let new_text = init_list + &body(new_line, indentation, &unit);
+    let new_text = init_list + &body(new_line, indentation, &unit, "");
 
     let start = func.decl_end;
     let end = symbol.range.end;
@@ -391,7 +383,8 @@ fn cursor_in(text: &str) -> usize {
     let mut offset = 0;
     let lines: Vec<&str> = text.split('\n').collect();
     for (i, line) in lines.iter().enumerate() {
-        if line.trim_start().starts_with(':') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(':') && !trimmed.starts_with("::") {
             if let Some(index) = line.rfind([')', '}']) {
                 return offset + index;
             }
@@ -422,7 +415,7 @@ fn out_of_line_definition(
         tree: target_tree,
         same_file,
     };
-    let definition = definition_text(decl, path, destination, initializers, &unit, config);
+    let definition = definition_text(decl, path, destination, initializers, "", &unit, config);
     let start = offset_to_position(target.text, definition.offset);
     let before_cursor = &definition.text[..definition.cursor];
     let lines = before_cursor.matches('\n').count() as u32;
@@ -439,12 +432,14 @@ fn out_of_line_definition(
     }
 }
 
-/// The formatted out-of-line definition and where it goes (`\n` line endings).
-fn definition_text(
+/// The formatted out-of-line definition of the declaration at `path` and where it goes
+/// (`\n` line endings). `body` is the body's content (see [`body`]), usually empty.
+pub(crate) fn definition_text(
     decl: &FileInput,
     path: SymbolPath,
     destination: Destination,
     initializers: Initializers,
+    body_content: &str,
     unit: &str,
     config: &Config,
 ) -> DefinitionText {
@@ -462,8 +457,9 @@ fn definition_text(
     let new_line = config
         .function_brace_format(target.is_c)
         .brace_on_new_line(func.is_constructor || func.is_destructor);
-    let skeleton =
-        signature + &initializer_list(path, initializers, unit, config) + &body(new_line, "", unit);
+    let skeleton = signature
+        + &initializer_list(path, initializers, unit, config)
+        + &body(new_line, "", unit, body_content);
     let text = format_text_to_insert(&skeleton, &position, target.text, unit);
     DefinitionText {
         offset: position.offset,
@@ -590,6 +586,7 @@ pub fn add_definitions(
             path,
             destination,
             Initializers::Required,
+            "",
             &unit,
             config,
         );

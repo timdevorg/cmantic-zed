@@ -160,6 +160,12 @@ pub struct VariableInfo {
     pub is_array: bool,
     /// Has a default member initializer (`= value` or `{value}`).
     pub has_initializer: bool,
+    /// A function pointer or function reference (`int (*fp)(int)`).
+    pub is_function: bool,
+    /// Text of the declaration before the name, as if this declarator were the only one:
+    /// specifiers and type shared by all declarators plus this declarator's own `*`/`&`
+    /// (`static const int* `). Comments and attributes are removed.
+    pub leading_text: String,
 }
 
 impl VariableInfo {
@@ -824,6 +830,26 @@ impl<'t> Collector<'t> {
         let declarators: Vec<Node> = node
             .children_by_field_name("declarator", &mut cursor)
             .collect();
+        // Specifiers and type shared by all declarators, without attributes.
+        let shared_end = declarators
+            .first()
+            .map_or(node.end_byte(), |d| d.start_byte());
+        let mut shared = String::new();
+        let mut pos = node.start_byte();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.start_byte() >= shared_end {
+                break;
+            }
+            if matches!(
+                child.kind(),
+                "attribute_declaration" | "attribute_specifier"
+            ) {
+                shared.push_str(&self.text[pos..child.start_byte()]);
+                pos = child.end_byte();
+            }
+        }
+        shared.push_str(&self.text[pos.min(shared_end)..shared_end]);
         let mut cursor = node.walk();
         let default_values: Vec<Node> = node
             .children_by_field_name("default_value", &mut cursor)
@@ -857,6 +883,11 @@ impl<'t> Collector<'t> {
                 || default_values.iter().any(|v| {
                     v.start_byte() >= declarator.end_byte() && v.start_byte() < next_start
                 });
+            let own = &self.text[declarator.start_byte().min(id.start_byte())..id.start_byte()];
+            let mut leading_text = strip_comments(&format!("{shared}{own}"));
+            if leading_text.ends_with(crate::text::is_word_char) {
+                leading_text.push(' ');
+            }
             out.push(VariableInfo {
                 name: self.node_text(id).to_string(),
                 name_range: id.byte_range(),
@@ -866,6 +897,8 @@ impl<'t> Collector<'t> {
                 is_pointer,
                 is_array: declarator.kind() == "array_declarator",
                 has_initializer,
+                is_function: contains_function_declarator(*declarator),
+                leading_text,
             });
         }
         out
@@ -1084,6 +1117,30 @@ fn find_function_declarator(mut node: Node) -> Option<Node> {
     }
 }
 
+/// Whether a variable declarator declares a function pointer/reference.
+fn contains_function_declarator(mut node: Node) -> bool {
+    loop {
+        match node.kind() {
+            "function_declarator" => return true,
+            "pointer_declarator"
+            | "reference_declarator"
+            | "parenthesized_declarator"
+            | "attributed_declarator"
+            | "array_declarator" => {
+                let mut cursor = node.walk();
+                match node
+                    .child_by_field_name("declarator")
+                    .or_else(|| node.named_children(&mut cursor).next())
+                {
+                    Some(inner) => node = inner,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
 fn innermost_name(mut node: Node) -> Node {
     while node.kind() == "qualified_identifier" {
         match node.child_by_field_name("name") {
@@ -1183,7 +1240,7 @@ fn is_word(token: &str) -> bool {
     token.chars().next().is_some_and(crate::text::is_word_char)
 }
 
-fn strip_comments(text: &str) -> String {
+pub fn strip_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     loop {
@@ -1303,6 +1360,23 @@ mod tests {
             .collect();
         assert_eq!(required, vec!["r", "p"]);
         assert_eq!(class.constructors().count(), 1);
+        let leading: Vec<&str> = class
+            .non_static_member_variables()
+            .map(|v| v.leading_text.as_str())
+            .collect();
+        assert_eq!(
+            leading,
+            vec![
+                "const int ",
+                "int& ",
+                "int* const ",
+                "int ",
+                "const char* ",
+                "int ",
+                "std::string ",
+                "mutable int "
+            ]
+        );
         assert_eq!(
             class.access_at(text.find("Foo(int").unwrap()),
             Access::Public

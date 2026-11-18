@@ -292,6 +292,7 @@ fn every_offset_is_safe() {
                 }
             }
             let _ = available_bulk_targets(&decl, position, Some(&src));
+            let _ = cmantic_ls::actions::may_offer_actions_at(&decl, position);
         }
         // The bulk result doesn't depend on the cursor.
         for target in [BulkTarget::MatchingSource, BulkTarget::CurrentFile] {

@@ -3,8 +3,8 @@
 C/C++ refactorings for [Zed](https://zed.dev), ported from the
 [C-Mantic](https://github.com/BigBahss/vscode-cmantic) VS Code extension.
 
-> **Status: early development.** **Add Definition** is implemented; the other
-> refactorings are still being ported.
+> **Status: early development.** Add Definition and Generate Getters and Setters are
+> implemented; the other refactorings are still being ported.
 
 ## How it works
 
@@ -23,7 +23,7 @@ The Zed extension downloads `cmantic-ls` from this repo's GitHub releases and st
 | Add all missing definitions (matching source file / this file) | done |
 | Generate Constructor with member initializers | done (all members, no picker) |
 | Add Declaration | planned |
-| Generate Getters and Setters | planned |
+| Generate Getters and Setters | done |
 | Generate equality, relational and stream output operators | planned |
 | Add Header Guard, Add Include, Create Matching Source File | planned |
 | Move Definition | planned |
@@ -112,6 +112,55 @@ initializer). The cursor moves into the first new body when `revealNewDefinition
 C-Mantic shows a picker to choose functions and the target file; this port always adds all
 of them.
 
+## Generate Getters and Setters
+
+Put the cursor on a member variable of a class or struct (in C++ files) to get:
+
+- **Generate Getter and Setter for "x"**
+- **Generate Getter for "x"**
+- **Generate Setter for "x"**
+
+Only what doesn't exist yet is offered (a class member with the getter's or setter's name
+counts as existing), and there is no setter for `const`, `constexpr` and reference members.
+Static members get static accessors. With the cursor on the shared type of `int a, b;` the
+first declarator is used; put it on `b` for `b`.
+
+```cpp
+class Foo {
+public:
+    int count() const { return m_count; }
+    void setCount(int count) { m_count = count; }
+
+private:
+    int m_count;
+};
+```
+
+Naming follows C-Mantic: `m_`, `s_` and leading/trailing `_` are stripped (`m_count` ->
+`count()` / `setCount`), a name without such a prefix gets `get` (`value` -> `getValue()`),
+and `caseStyle` picks camelCase, snake_case or PascalCase. With `cpp.accessor.boolGetterIsPrefix`
+`bool` members get `isX()`. The setter parameter is the base name, or the name with a trailing
+`_` when that would be the member's own name.
+
+The new functions go after the last public member (next to an existing getter or setter if
+there is one). If the class has no public members, a `public:` section is added after the last
+member, indented like the class's other access labels. `cpp.accessor.getterDefinitionLocation`
+and `setterDefinitionLocation` choose between an inline definition (default), a declaration
+plus a definition below the class, or a definition in the matching source file (below the
+class if there is no matching source file, or for class templates).
+
+Differences from C-Mantic:
+
+- Types are judged by syntax only (there is no clangd here; C-Mantic does the same with its
+  default `resolveTypes: false`). The setter takes pointers and types spelled with a primitive
+  keyword (`int`, `unsigned long`, `bool`, ...) by value and everything else by `const T &`,
+  including enums and typedefs of primitives like `std::size_t`.
+- The getter returns by value, like C-Mantic, but only top-level `const`/`volatile` are
+  dropped from the return type, so `const char*` and `const T&` members give valid getters.
+- No accessors for arrays, function pointers, members of anonymous structs/unions, or member
+  templates (C-Mantic would produce code that doesn't compile).
+- Also offered in source files, not only in headers.
+
 ## Settings
 
 Server settings go under `lsp.cmantic.settings` (the same keys are accepted in
@@ -126,9 +175,16 @@ Server settings go under `lsp.cmantic.settings` (the same keys are accepted in
         "sourceExtensions": ["c", "cpp", "cc", "cxx"],
         "cpp": {
           "curlyBraceFormat": { "function": "newLineCtorDtor" },
-          "bracedInitialization": false
+          "bracedInitialization": false,
+          "accessor": {
+            "getterDefinitionLocation": "inline",
+            "setterDefinitionLocation": "inline",
+            "boolGetterIsPrefix": false
+          },
+          "useExplicitThisPointer": false
         },
         "c": { "curlyBraceFormat": { "function": "newLine" } },
+        "caseStyle": "camelCase",
         "revealNewDefinition": true
       }
     }
@@ -141,7 +197,11 @@ Server settings go under `lsp.cmantic.settings` (the same keys are accepted in
 | `headerExtensions`, `sourceExtensions` | File extensions (without the dot) used to tell headers and source files apart and to find the matching file. |
 | `cpp.curlyBraceFormat.function`, `c.curlyBraceFormat.function` | Where the opening brace of a new function goes: `"newLine"`, `"sameLine"`, or `"newLineCtorDtor"` (new line for constructors and destructors only). The language of the file that receives the definition decides which one applies. |
 | `cpp.bracedInitialization` | Use `member{}` instead of `member()` in generated constructor initializer lists. |
-| `revealNewDefinition` | After adding a definition to the matching source file, or adding all missing definitions, open the file with the cursor in the (first) new body. |
+| `cpp.accessor.getterDefinitionLocation`, `cpp.accessor.setterDefinitionLocation` | Where new getters/setters are defined: `"inline"` (in the class), `"belowClass"` (declaration in the class, definition below it), or `"matchingSourceFile"` (falls back to `"belowClass"` without a matching source file or for class templates). C-Mantic's values (`"Generate definition inline"`, ...) are accepted too. |
+| `cpp.accessor.boolGetterIsPrefix` | Name getters of `bool` members `isX` instead of `getX`. |
+| `cpp.useExplicitThisPointer` | Write `this->member` in generated member functions. |
+| `caseStyle` | Naming of generated getters and setters: `"camelCase"`, `"snake_case"` or `"PascalCase"`. |
+| `revealNewDefinition` | After adding a definition to the matching source file, or adding all missing definitions, open the file with the cursor in the (first) new body. Also used for getters/setters defined in the matching source file. |
 
 Indentation is detected from the file being edited (4 spaces if it has none).
 

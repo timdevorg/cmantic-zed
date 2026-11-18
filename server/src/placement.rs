@@ -1,7 +1,7 @@
 //! Where to put a new definition (ports of `SourceDocument.findSmartPositionForFunctionDefinition`
 //! and `ProposedPosition.formatTextToInsert`).
 
-use crate::symbol::{ScopeKind, Symbol, SymbolKind, SymbolPath, SymbolTree};
+use crate::symbol::{Access, ScopeKind, Symbol, SymbolKind, SymbolPath, SymbolTree};
 use crate::text::{leading_whitespace, line_count, line_end, line_of, line_start, line_text};
 
 /// A byte offset in the target file plus hints for how to format text inserted there.
@@ -169,6 +169,71 @@ fn position_in_parent_namespace(
         }
     }
     None
+}
+
+/// Which side of an existing member a new member function goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Before,
+    After,
+}
+
+/// Whether a direct child of a class declares `name` (function, variable or nested type).
+pub fn declares_name(child: &Symbol, name: &str) -> bool {
+    child.function.as_ref().is_some_and(|f| f.name == name)
+        || child.variables.iter().any(|v| v.name == name)
+        || child.kind == SymbolKind::Class && child.name == name
+}
+
+/// Position for a new public member function in `class` (`CSymbol.findPositionForNewMemberFunction`
+/// with `AccessLevel.public`): next to the member named by `relative` if there is one, else after
+/// the last public member, else after the last member (or at the start of an empty body).
+/// The caller adds a `public:` label when the position isn't public.
+pub fn find_position_for_new_member_function(
+    text: &str,
+    class: &Symbol,
+    relative: Option<(&str, Side)>,
+) -> ProposedPosition {
+    if let Some((name, side)) = relative
+        && let Some(child) = class.children.iter().rev().find(|c| declares_name(c, name))
+    {
+        return match side {
+            Side::Before => ProposedPosition {
+                offset: child.comment_start,
+                relative_to: Some(child.range.start),
+                before: true,
+                next_to: true,
+                ..Default::default()
+            },
+            Side::After => ProposedPosition {
+                offset: trailing_comment_end(text, child),
+                relative_to: Some(child.range.start),
+                after: true,
+                next_to: true,
+                ..Default::default()
+            },
+        };
+    }
+    if let Some(child) = class
+        .children
+        .iter()
+        .rev()
+        .find(|c| class.access_at(c.range.end) == Access::Public)
+    {
+        return ProposedPosition::after(trailing_comment_end(text, child), Some(child.range.start));
+    }
+    match class.children.last() {
+        Some(last) => {
+            ProposedPosition::after(trailing_comment_end(text, last), Some(last.range.start))
+        }
+        None => ProposedPosition {
+            offset: class.body.as_ref().map_or(class.range.end, |b| b.start + 1),
+            after: true,
+            next_to: true,
+            indent: true,
+            ..Default::default()
+        },
+    }
 }
 
 /// Indents and pads `insert_text` (which uses `\n` line endings) for insertion at `position`

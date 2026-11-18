@@ -301,6 +301,17 @@ impl Harness {
         call(&mut self.service, request(self.next_id, method, params)).await
     }
 
+    async fn configure(&mut self, settings: Value) {
+        call(
+            &mut self.service,
+            notification(
+                "workspace/didChangeConfiguration",
+                json!({ "settings": settings }),
+            ),
+        )
+        .await;
+    }
+
     async fn open(&mut self, path: &str) {
         let text = fs::read_to_string(self.dir.0.join(path)).unwrap();
         let uri = self.uri(path);
@@ -477,5 +488,116 @@ async fn generate_constructor_initializing_all_members() {
     assert_eq!(
         sent[1].1["selection"]["start"],
         json!({ "line": 3, "character": 11 })
+    );
+}
+
+const ACCESSOR_HEADER: &str =
+    "#pragma once\n\nclass Foo {\npublic:\n    Foo();\nprivate:\n    int m_count;\n};\n";
+
+#[tokio::test]
+async fn generate_getter_and_setter_inline() {
+    let mut h = Harness::new("accessors-inline", &[("foo.h", ACCESSOR_HEADER)]).await;
+    h.open("foo.h").await;
+    // Nothing else is offered on a member variable.
+    let actions = h.actions("foo.h", 6, 9).await;
+    assert_eq!(
+        titles(&actions),
+        vec![
+            "Generate Getter and Setter for \"m_count\"",
+            "Generate Getter for \"m_count\"",
+            "Generate Setter for \"m_count\""
+        ]
+    );
+    // Inline (the default) is a plain edit.
+    let both = find(&actions, "Generate Getter and Setter for \"m_count\"");
+    assert!(both.get("command").is_none());
+    assert_eq!(
+        both["edit"]["changes"][&h.uri("foo.h")],
+        json!([{
+            "range": { "start": { "line": 4, "character": 10 }, "end": { "line": 4, "character": 10 } },
+            "newText": "\n    int count() const { return m_count; }\n    void setCount(int count) { m_count = count; }"
+        }])
+    );
+}
+
+#[tokio::test]
+async fn generate_getter_and_setter_in_matching_source_file() {
+    let mut h = Harness::new(
+        "accessors-source",
+        &[
+            ("foo.h", ACCESSOR_HEADER),
+            ("foo.cpp", "#include \"foo.h\"\n"),
+        ],
+    )
+    .await;
+    h.configure(json!({ "cpp": { "accessor": {
+        "getterDefinitionLocation": "matchingSourceFile",
+        "setterDefinitionLocation": "matchingSourceFile"
+    } } }))
+    .await;
+    h.open("foo.h").await;
+    let actions = h.actions("foo.h", 6, 9).await;
+    assert_eq!(actions.len(), 3);
+    for action in &actions {
+        assert!(action.get("edit").is_none());
+        assert_eq!(action["kind"], "refactor");
+    }
+    let sent = h
+        .run(find(&actions, "Generate Getter and Setter for \"m_count\""))
+        .await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[0].0, "workspace/applyEdit");
+    let changes = &sent[0].1["edit"]["changes"];
+    assert_eq!(
+        changes[&h.uri("foo.h")],
+        json!([{
+            "range": { "start": { "line": 4, "character": 10 }, "end": { "line": 4, "character": 10 } },
+            "newText": "\n    int count() const;\n    void setCount(int count);"
+        }])
+    );
+    let source_uri = h.uri("foo.cpp");
+    assert_eq!(
+        changes[&source_uri],
+        json!([{
+            "range": { "start": { "line": 0, "character": 16 }, "end": { "line": 0, "character": 16 } },
+            "newText": "\n\nint Foo::count() const {\n    return m_count;\n}\n\nvoid Foo::setCount(int count) {\n    m_count = count;\n}"
+        }])
+    );
+    assert_eq!(sent[1].0, "window/showDocument");
+    assert_eq!(sent[1].1["uri"], json!(source_uri));
+    assert_eq!(
+        sent[1].1["selection"]["start"],
+        json!({ "line": 3, "character": 19 })
+    );
+
+    // Getter and setter alone also go through the command.
+    for title in [
+        "Generate Getter for \"m_count\"",
+        "Generate Setter for \"m_count\"",
+    ] {
+        let sent = h.run(find(&actions, title)).await;
+        assert_eq!(sent[0].0, "workspace/applyEdit", "{title}");
+        assert_eq!(
+            sent[0].1["edit"]["changes"].as_object().unwrap().len(),
+            2,
+            "{title}"
+        );
+        assert_eq!(sent[1].0, "window/showDocument", "{title}");
+    }
+}
+
+#[tokio::test]
+async fn generate_accessors_falls_back_below_class_without_source_file() {
+    let mut h = Harness::new("accessors-nosource", &[("foo.h", ACCESSOR_HEADER)]).await;
+    h.configure(
+        json!({ "cpp": { "accessor": { "getterDefinitionLocation": "matchingSourceFile" } } }),
+    )
+    .await;
+    h.open("foo.h").await;
+    let actions = h.actions("foo.h", 6, 9).await;
+    let getter = find(&actions, "Generate Getter for \"m_count\"");
+    assert_eq!(
+        getter["edit"]["changes"][&h.uri("foo.h")][1]["newText"],
+        "\n\ninline int Foo::count() const {\n    return m_count;\n}"
     );
 }

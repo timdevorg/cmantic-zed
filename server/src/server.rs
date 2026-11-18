@@ -10,7 +10,9 @@ use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer};
 
+use crate::actions::accessors::{self, AccessorKind};
 use crate::actions::add_definition::{self, BulkTarget, FileInput, Initializers, Target};
+use crate::actions::member::GeneratedEdit;
 use crate::config::Config;
 use crate::document::Document;
 use crate::header_source::HeaderSourceCache;
@@ -29,6 +31,26 @@ pub mod action_id {
     pub const CONSTRUCTOR_MATCHING_SOURCE: &str = "generateConstructor.matchingSource";
     pub const ADD_DEFINITIONS_MATCHING_SOURCE: &str = "addDefinitions.matchingSource";
     pub const ADD_DEFINITIONS_CURRENT_FILE: &str = "addDefinitions.currentFile";
+    pub const GENERATE_GETTER_SETTER: &str = "generateGetterSetter";
+    pub const GENERATE_GETTER: &str = "generateGetter";
+    pub const GENERATE_SETTER: &str = "generateSetter";
+}
+
+fn accessor_action_id(kind: AccessorKind) -> &'static str {
+    match kind {
+        AccessorKind::GetterAndSetter => action_id::GENERATE_GETTER_SETTER,
+        AccessorKind::Getter => action_id::GENERATE_GETTER,
+        AccessorKind::Setter => action_id::GENERATE_SETTER,
+    }
+}
+
+fn accessor_kind(action: &str) -> Option<AccessorKind> {
+    match action {
+        action_id::GENERATE_GETTER_SETTER => Some(AccessorKind::GetterAndSetter),
+        action_id::GENERATE_GETTER => Some(AccessorKind::Getter),
+        action_id::GENERATE_SETTER => Some(AccessorKind::Setter),
+        _ => None,
+    }
 }
 
 /// Arguments of [`COMMAND_ADD_DEFINITION_IN_SOURCE`].
@@ -117,19 +139,7 @@ impl Backend {
             is_c: file.is_c,
         };
 
-        let needs_source = args.action != action_id::ADD_DEFINITIONS_CURRENT_FILE;
-        let source_uri = if needs_source {
-            match self.matching_source(&path, &config).await {
-                Some(uri) => Some(uri),
-                None => {
-                    self.show_warning("No matching source file was found.")
-                        .await;
-                    return Ok(None);
-                }
-            }
-        } else {
-            None
-        };
+        let source_uri = self.matching_source(&path, &config).await;
         let source_text = match &source_uri {
             Some(uri) => Some(
                 self.file_text(uri)
@@ -143,8 +153,25 @@ impl Backend {
             is_header: false,
             is_c: s.is_c,
         });
+        let needs_source = matches!(
+            args.action.as_str(),
+            action_id::ADD_DEFINITION_MATCHING_SOURCE
+                | action_id::CONSTRUCTOR_MATCHING_SOURCE
+                | action_id::ADD_DEFINITIONS_MATCHING_SOURCE
+        );
+        let source_uri = match source_uri {
+            Some(uri) => Some(uri),
+            None if needs_source => {
+                self.show_warning("No matching source file was found.")
+                    .await;
+                return Ok(None);
+            }
+            None => None,
+        };
 
-        let (target_uri, edits, cursor) = match args.action.as_str() {
+        // Edits per file, and where to put the cursor afterwards.
+        let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
+        let reveal: Option<(Uri, Position)> = match args.action.as_str() {
             action_id::ADD_DEFINITION_MATCHING_SOURCE | action_id::CONSTRUCTOR_MATCHING_SOURCE => {
                 let initializers = if args.action == action_id::CONSTRUCTOR_MATCHING_SOURCE {
                     Initializers::All
@@ -163,11 +190,12 @@ impl Backend {
                         .await;
                     return Ok(None);
                 };
-                (
-                    source_uri.clone().unwrap_or_else(|| args.uri.clone()),
+                let uri = source_uri.clone().unwrap_or_else(|| args.uri.clone());
+                changes.insert(
+                    uri.clone(),
                     vec![TextEdit::new(insertion.range, insertion.new_text)],
-                    insertion.cursor,
-                )
+                );
+                Some((uri, insertion.cursor))
             }
             action_id::ADD_DEFINITIONS_MATCHING_SOURCE
             | action_id::ADD_DEFINITIONS_CURRENT_FILE => {
@@ -187,13 +215,30 @@ impl Backend {
                         .await;
                     return Ok(None);
                 };
-                (target_uri, bulk.edits, bulk.cursor)
+                changes.insert(target_uri.clone(), bulk.edits);
+                Some((target_uri, bulk.cursor))
             }
-            other => return Err(invalid(&format!("unknown action: {other}"))),
+            other => {
+                let Some(kind) = accessor_kind(other) else {
+                    return Err(invalid(&format!("unknown action: {other}")));
+                };
+                let Some(generated) = accessors::generate_accessors(
+                    &decl,
+                    args.position,
+                    kind,
+                    source.as_ref(),
+                    &config,
+                ) else {
+                    self.show_info("Nothing to generate for this member variable.")
+                        .await;
+                    return Ok(None);
+                };
+                add_generated(&mut changes, generated, &args.uri, source_uri.as_ref())
+            }
         };
 
         let edit = WorkspaceEdit {
-            changes: Some(HashMap::from([(target_uri.clone(), edits)])),
+            changes: Some(changes),
             ..Default::default()
         };
         let applied = self
@@ -201,11 +246,14 @@ impl Backend {
             .apply_edit(edit)
             .await
             .is_ok_and(|response| response.applied);
-        if applied && config.reveal_new_definition {
+        if applied
+            && config.reveal_new_definition
+            && let Some((uri, cursor)) = reveal
+        {
             let _ = self
                 .client
                 .show_document(ShowDocumentParams {
-                    uri: target_uri,
+                    uri,
                     external: Some(false),
                     take_focus: Some(true),
                     selection: Some(Range::new(cursor, cursor)),
@@ -229,6 +277,25 @@ impl Backend {
         *self.config.write().await = Config::from_value(value);
         self.header_source.lock().await.clear();
     }
+}
+
+/// Adds a [`GeneratedEdit`] to `changes`; returns the cursor in the source file, if any.
+fn add_generated(
+    changes: &mut HashMap<Uri, Vec<TextEdit>>,
+    generated: GeneratedEdit,
+    uri: &Uri,
+    source_uri: Option<&Uri>,
+) -> Option<(Uri, Position)> {
+    if !generated.edits.is_empty() {
+        changes.insert(uri.clone(), generated.edits);
+    }
+    let source_uri = source_uri?;
+    if !generated.source_edits.is_empty() {
+        changes.insert(source_uri.clone(), generated.source_edits);
+    }
+    generated
+        .source_cursor
+        .map(|cursor| (source_uri.clone(), cursor))
 }
 
 fn wants_refactor(only: Option<&Vec<CodeActionKind>>) -> bool {
@@ -353,7 +420,7 @@ impl LanguageServer for Backend {
             is_header,
             is_c: file.is_c,
         };
-        if !add_definition::may_offer_actions_at(&decl, position) {
+        if !crate::actions::may_offer_actions_at(&decl, position) {
             return Ok(None);
         }
         let source_uri = match &path {
@@ -387,15 +454,12 @@ impl LanguageServer for Backend {
                 ..Default::default()
             })
         };
-        let edit_action = |title: &str, insertion: add_definition::Insertion| {
+        let edit_action = |title: &str, edits: Vec<TextEdit>| {
             CodeActionOrCommand::CodeAction(CodeAction {
                 title: title.into(),
                 kind: Some(CodeActionKind::REFACTOR),
                 edit: Some(WorkspaceEdit {
-                    changes: Some(HashMap::from([(
-                        uri.clone(),
-                        vec![TextEdit::new(insertion.range, insertion.new_text)],
-                    )])),
+                    changes: Some(HashMap::from([(uri.clone(), edits)])),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -436,7 +500,10 @@ impl LanguageServer for Backend {
                             initializers,
                             &config,
                         ) {
-                            actions.push(edit_action(title, insertion));
+                            actions.push(edit_action(
+                                title,
+                                vec![TextEdit::new(insertion.range, insertion.new_text)],
+                            ));
                         }
                     }
                 }
@@ -448,6 +515,18 @@ impl LanguageServer for Backend {
                 BulkTarget::CurrentFile => action_id::ADD_DEFINITIONS_CURRENT_FILE,
             };
             actions.push(command_action(target.title(), id));
+        }
+        for action in accessors::available_accessors(&decl, position, source.is_some(), &config) {
+            if action.uses_matching_source {
+                actions.push(command_action(
+                    &action.title,
+                    accessor_action_id(action.kind),
+                ));
+            } else if let Some(generated) =
+                accessors::generate_accessors(&decl, position, action.kind, None, &config)
+            {
+                actions.push(edit_action(&action.title, generated.edits));
+            }
         }
         Ok((!actions.is_empty()).then_some(actions))
     }
