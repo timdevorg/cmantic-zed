@@ -1,0 +1,11 @@
+id = "cmantic"
+name = "C-Mantic"
+description = "C/C++ refactorings: add definitions, declarations, getters/setters and more. A port of the C-Mantic VS Code extension."
+version = "0.1.0"
+schema_version = 1
+authors = ["timdevorg"]
+repository = "https://github.com/timdevorg/cmantic-zed"
+
+[language_servers.cmantic]
+name = "C-Mantic"
+languages = ["C", "C++"]

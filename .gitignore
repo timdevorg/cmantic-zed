@@ -1,0 +1,9 @@
+# Build output
+/target/
+*.wasm
+
+# Original VS Code C-Mantic source, kept locally for reference only
+/reference/
+
+# Editor / OS
+.DS_Store
