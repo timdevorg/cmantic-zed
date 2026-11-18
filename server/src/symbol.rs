@@ -115,6 +115,61 @@ fn is_specialization(template_statement: &str) -> bool {
         .is_some_and(|rest| rest.trim().trim_start_matches('<').trim() == ">")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassKey {
+    Class,
+    Struct,
+    Union,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    Public,
+    Protected,
+    Private,
+}
+
+/// A base class in a class head (`: public ns::Base<T>`).
+#[derive(Debug, Clone)]
+pub struct BaseClass {
+    /// Full type as written: `ns::Base<T>`.
+    pub text: String,
+    /// Unqualified name without template arguments (`Base`), as used in a member initializer.
+    pub name: String,
+}
+
+/// Extra information about a class, struct or union with a body.
+#[derive(Debug, Clone)]
+pub struct ClassInfo {
+    pub key: ClassKey,
+    pub base_classes: Vec<BaseClass>,
+    /// Access specifier labels in the body (`public:`, range includes the colon), in order.
+    pub access_specifiers: Vec<(Range<usize>, Access)>,
+}
+
+/// One declarator of a variable declaration (`int a, *b;` has two).
+#[derive(Debug, Clone)]
+pub struct VariableInfo {
+    pub name: String,
+    pub name_range: Range<usize>,
+    pub is_static: bool,
+    /// Top-level `const` (`const int x`, `int* const p`, not `const char* p`).
+    pub is_const: bool,
+    pub is_reference: bool,
+    pub is_pointer: bool,
+    pub is_array: bool,
+    /// Has a default member initializer (`= value` or `{value}`).
+    pub has_initializer: bool,
+}
+
+impl VariableInfo {
+    /// Const and reference members without a default member initializer must be initialized
+    /// by every constructor.
+    pub fn requires_initialization(&self) -> bool {
+        !self.is_static && !self.has_initializer && (self.is_const || self.is_reference)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Symbol {
     pub kind: SymbolKind,
@@ -132,9 +187,45 @@ pub struct Symbol {
     pub own_scopes: Vec<Scope>,
     pub children: Vec<Symbol>,
     pub function: Option<FunctionInfo>,
+    /// Set for classes, structs and unions with a body.
+    pub class: Option<ClassInfo>,
+    /// Declarators of a variable declaration (member or not); empty for other symbols.
+    pub variables: Vec<VariableInfo>,
 }
 
 impl Symbol {
+    /// Non-static data members of this class, in declaration order.
+    pub fn non_static_member_variables(&self) -> impl Iterator<Item = &VariableInfo> {
+        self.children
+            .iter()
+            .flat_map(|c| &c.variables)
+            .filter(|v| !v.is_static)
+    }
+
+    /// Constructor declarations and definitions directly inside this class.
+    pub fn constructors(&self) -> impl Iterator<Item = &Symbol> {
+        self.children
+            .iter()
+            .filter(|c| c.function.as_ref().is_some_and(|f| f.is_constructor))
+    }
+
+    /// The access in effect at `offset` inside this class's body.
+    pub fn access_at(&self, offset: usize) -> Access {
+        let Some(class) = &self.class else {
+            return Access::Public;
+        };
+        let mut access = match class.key {
+            ClassKey::Class => Access::Private,
+            ClassKey::Struct | ClassKey::Union => Access::Public,
+        };
+        for (range, label) in &class.access_specifiers {
+            if range.end <= offset {
+                access = *label;
+            }
+        }
+        access
+    }
+
     pub fn is_function_declaration(&self) -> bool {
         self.function
             .as_ref()
@@ -438,7 +529,11 @@ impl<'t> Collector<'t> {
                 }
                 match self.function(node, templates, scopes, false) {
                     Some(func) => Some(self.function_symbol(func, range, scopes)),
-                    None => Some(self.other(range, scopes)),
+                    None => {
+                        let mut symbol = self.other(range, scopes);
+                        symbol.variables = self.variables(node);
+                        Some(symbol)
+                    }
                 }
             }
             "function_definition" => {
@@ -471,6 +566,8 @@ impl<'t> Collector<'t> {
             own_scopes: Vec::new(),
             children: Vec::new(),
             function: None,
+            class: None,
+            variables: Vec::new(),
         }
     }
 
@@ -513,6 +610,8 @@ impl<'t> Collector<'t> {
             own_scopes,
             children,
             function: None,
+            class: None,
+            variables: Vec::new(),
         })
     }
 
@@ -575,6 +674,16 @@ impl<'t> Collector<'t> {
             own_scopes: vec![scope],
             children,
             function: None,
+            class: Some(ClassInfo {
+                key: match node.kind() {
+                    "struct_specifier" => ClassKey::Struct,
+                    "union_specifier" => ClassKey::Union,
+                    _ => ClassKey::Class,
+                },
+                base_classes: self.base_classes(node),
+                access_specifiers: self.access_specifiers(body),
+            }),
+            variables: Vec::new(),
         })
     }
 
@@ -640,7 +749,126 @@ impl<'t> Collector<'t> {
             own_scopes: Vec::new(),
             children: Vec::new(),
             function: Some(func),
+            class: None,
+            variables: Vec::new(),
         }
+    }
+
+    fn base_classes(&self, class_node: Node) -> Vec<BaseClass> {
+        let mut cursor = class_node.walk();
+        let Some(clause) = class_node
+            .children(&mut cursor)
+            .find(|c| c.kind() == "base_class_clause")
+        else {
+            return Vec::new();
+        };
+        let mut cursor = clause.walk();
+        clause
+            .named_children(&mut cursor)
+            .filter(|c| {
+                matches!(
+                    c.kind(),
+                    "type_identifier" | "qualified_identifier" | "template_type"
+                )
+            })
+            .map(|c| {
+                let mut name = innermost_name(c);
+                if name.kind() == "template_type"
+                    && let Some(base) = name.child_by_field_name("name")
+                {
+                    name = base;
+                }
+                BaseClass {
+                    text: normalize_whitespace(self.node_text(c)),
+                    name: self.node_text(name).to_string(),
+                }
+            })
+            .collect()
+    }
+
+    fn access_specifiers(&self, body: Node) -> Vec<(Range<usize>, Access)> {
+        let mut cursor = body.walk();
+        let children: Vec<Node> = body.children(&mut cursor).collect();
+        let mut out = Vec::new();
+        for (i, child) in children.iter().enumerate() {
+            if child.kind() != "access_specifier" {
+                continue;
+            }
+            let access = match self.node_text(*child).trim() {
+                "public" => Access::Public,
+                "protected" => Access::Protected,
+                _ => Access::Private,
+            };
+            let end = children
+                .get(i + 1)
+                .filter(|n| n.kind() == ":")
+                .map_or(child.end_byte(), |n| n.end_byte());
+            out.push((child.start_byte()..end, access));
+        }
+        out
+    }
+
+    /// The declarators of a (member) variable declaration.
+    fn variables(&self, node: Node) -> Vec<VariableInfo> {
+        let mut is_static = false;
+        let mut decl_const = false;
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "storage_class_specifier" if self.node_text(child) == "static" => is_static = true,
+                "type_qualifier" if self.node_text(child) == "const" => decl_const = true,
+                _ => {}
+            }
+        }
+        let mut cursor = node.walk();
+        let declarators: Vec<Node> = node
+            .children_by_field_name("declarator", &mut cursor)
+            .collect();
+        let mut cursor = node.walk();
+        let default_values: Vec<Node> = node
+            .children_by_field_name("default_value", &mut cursor)
+            .collect();
+        let mut out = Vec::new();
+        for (i, declarator) in declarators.iter().enumerate() {
+            let initialized = declarator.kind() == "init_declarator";
+            let declarator = &match declarator.kind() {
+                "init_declarator" => declarator
+                    .child_by_field_name("declarator")
+                    .unwrap_or(*declarator),
+                _ => *declarator,
+            };
+            let Some(id) = innermost_identifier(*declarator) else {
+                continue;
+            };
+            let is_pointer = declarator.kind() == "pointer_declarator";
+            let is_const = if is_pointer {
+                let mut cursor = declarator.walk();
+                declarator
+                    .children(&mut cursor)
+                    .any(|c| c.kind() == "type_qualifier" && self.node_text(c) == "const")
+            } else {
+                decl_const
+            };
+            // A default member initializer belongs to the declarator before it.
+            let next_start = declarators
+                .get(i + 1)
+                .map_or(usize::MAX, |d| d.start_byte());
+            let has_initializer = initialized
+                || default_values.iter().any(|v| {
+                    v.start_byte() >= declarator.end_byte() && v.start_byte() < next_start
+                });
+            out.push(VariableInfo {
+                name: self.node_text(id).to_string(),
+                name_range: id.byte_range(),
+                is_static,
+                is_const,
+                is_reference: declarator.kind() == "reference_declarator",
+                is_pointer,
+                is_array: declarator.kind() == "array_declarator",
+                has_initializer,
+            });
+        }
+        out
     }
 
     /// Analyses a `declaration`, `field_declaration` or `function_definition`.
@@ -1047,6 +1275,45 @@ mod tests {
                 FunctionBody::Body,
                 FunctionBody::None
             ]
+        );
+    }
+
+    #[test]
+    fn class_members_bases_and_access() {
+        let text = "class Foo : public ns::Base<int>, private virtual Other {\npublic:\n    Foo(int x);\n    static int s;\n    const int c = 1;\n    int& r;\n    int* const p, q[3];\n    const char* cp;\n    int b : 3;\n    std::string name{\"x\"};\nprotected:\n    mutable int m;\n};\n";
+        let tree = SymbolTree::new(text);
+        let class = &tree.symbols[0];
+        let info = class.class.as_ref().unwrap();
+        assert_eq!(info.key, ClassKey::Class);
+        let bases: Vec<(&str, &str)> = info
+            .base_classes
+            .iter()
+            .map(|b| (b.text.as_str(), b.name.as_str()))
+            .collect();
+        assert_eq!(bases, vec![("ns::Base<int>", "Base"), ("Other", "Other")]);
+        let members: Vec<&str> = class
+            .non_static_member_variables()
+            .map(|v| v.name.as_str())
+            .collect();
+        assert_eq!(members, vec!["c", "r", "p", "q", "cp", "b", "name", "m"]);
+        let required: Vec<&str> = class
+            .non_static_member_variables()
+            .filter(|v| v.requires_initialization())
+            .map(|v| v.name.as_str())
+            .collect();
+        assert_eq!(required, vec!["r", "p"]);
+        assert_eq!(class.constructors().count(), 1);
+        assert_eq!(
+            class.access_at(text.find("Foo(int").unwrap()),
+            Access::Public
+        );
+        assert_eq!(
+            class.access_at(text.find("mutable").unwrap()),
+            Access::Protected
+        );
+        assert_eq!(
+            class.access_at(text.find('{').unwrap() + 1),
+            Access::Private
         );
     }
 

@@ -6,6 +6,7 @@
 pub mod actions;
 pub mod config;
 pub mod document;
+pub mod edit_buffer;
 pub mod header_source;
 pub mod placement;
 pub mod server;

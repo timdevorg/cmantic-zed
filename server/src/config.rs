@@ -37,6 +37,8 @@ pub struct CurlyBraceSettings {
 #[serde(rename_all = "camelCase", default)]
 pub struct LanguageSettings {
     pub curly_brace_format: CurlyBraceSettings,
+    /// Use `member{}` instead of `member()` in generated member initializer lists (C++ only).
+    pub braced_initialization: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -61,11 +63,13 @@ impl Default for Config {
                 curly_brace_format: CurlyBraceSettings {
                     function: CurlyBraceFormat::NewLineCtorDtor,
                 },
+                braced_initialization: false,
             },
             c: LanguageSettings {
                 curly_brace_format: CurlyBraceSettings {
                     function: CurlyBraceFormat::NewLine,
                 },
+                braced_initialization: false,
             },
             reveal_new_definition: true,
         }
@@ -124,6 +128,12 @@ impl Config {
         if let Some(format) = brace("/c/curlyBraceFormat/function") {
             config.c.curly_brace_format.function = format;
         }
+        if let Some(braced) = value
+            .pointer("/cpp/bracedInitialization")
+            .and_then(Value::as_bool)
+        {
+            config.cpp.braced_initialization = braced;
+        }
         if let Some(reveal) = value.get("revealNewDefinition").and_then(Value::as_bool) {
             config.reveal_new_definition = reveal;
         }
@@ -178,9 +188,10 @@ mod tests {
     fn parses_settings() {
         let config = Config::from_value(&json!({
             "headerExtensions": ["h"],
-            "cpp": { "curlyBraceFormat": { "function": "sameLine" } },
-            "revealNewDefinition": false
+            "revealNewDefinition": false,
+            "cpp": { "curlyBraceFormat": { "function": "sameLine" }, "bracedInitialization": true }
         }));
+        assert!(config.cpp.braced_initialization);
         assert_eq!(config.header_extensions, vec!["h"]);
         assert_eq!(config.source_extensions.len(), 4);
         assert_eq!(

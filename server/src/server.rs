@@ -10,7 +10,7 @@ use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer};
 
-use crate::actions::add_definition::{self, FileInput, Target};
+use crate::actions::add_definition::{self, BulkTarget, FileInput, Initializers, Target};
 use crate::config::Config;
 use crate::document::Document;
 use crate::header_source::HeaderSourceCache;
@@ -18,11 +18,32 @@ use crate::header_source::HeaderSourceCache;
 /// Command run by the "Add Definition in matching source file" code action.
 pub const COMMAND_ADD_DEFINITION_IN_SOURCE: &str = "cmantic.addDefinitionInSourceFile";
 
+/// Generic command for code actions that edit another file or move the cursor: the server
+/// recomputes the action named by [`ActionArgs::action`], sends `workspace/applyEdit` and then
+/// `window/showDocument`.
+pub const COMMAND_APPLY_ACTION: &str = "cmantic.applyAction";
+
+/// Action ids used with [`COMMAND_APPLY_ACTION`].
+pub mod action_id {
+    pub const ADD_DEFINITION_MATCHING_SOURCE: &str = "addDefinition.matchingSource";
+    pub const CONSTRUCTOR_MATCHING_SOURCE: &str = "generateConstructor.matchingSource";
+    pub const ADD_DEFINITIONS_MATCHING_SOURCE: &str = "addDefinitions.matchingSource";
+    pub const ADD_DEFINITIONS_CURRENT_FILE: &str = "addDefinitions.currentFile";
+}
+
 /// Arguments of [`COMMAND_ADD_DEFINITION_IN_SOURCE`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddDefinitionArgs {
     pub uri: Uri,
     pub position: Position,
+}
+
+/// Arguments of [`COMMAND_APPLY_ACTION`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionArgs {
+    pub uri: Uri,
+    pub position: Position,
+    pub action: String,
 }
 
 pub struct Backend {
@@ -76,54 +97,103 @@ impl Backend {
         Uri::from_file_path(found)
     }
 
-    async fn add_definition_in_source(&self, args: AddDefinitionArgs) -> Result<Option<Value>> {
+    /// Runs a command-based action (see [`action_id`]).
+    async fn run_action(&self, args: ActionArgs) -> Result<Option<Value>> {
         let config = self.config.read().await.clone();
         let invalid = |message: &str| Error::invalid_params(message.to_string());
         let path = args
             .uri
             .to_file_path()
-            .ok_or_else(|| invalid("not a file URI"))?;
-        let header = self
+            .ok_or_else(|| invalid("not a file URI"))?
+            .into_owned();
+        let file = self
             .file_text(&args.uri)
             .await
             .ok_or_else(|| invalid("cannot read the file"))?;
-        let Some(source_uri) = self.matching_source(&path, &config).await else {
-            self.show_warning("No matching source file was found.")
-                .await;
-            return Ok(None);
-        };
-        let source = self
-            .file_text(&source_uri)
-            .await
-            .ok_or_else(|| invalid("cannot read the matching source file"))?;
-
+        let is_header = config.is_header(&path.to_string_lossy());
         let decl = FileInput {
-            text: &header.text,
-            is_header: true,
-            is_c: header.is_c,
+            text: &file.text,
+            is_header,
+            is_c: file.is_c,
         };
-        let target = FileInput {
-            text: &source.text,
+
+        let needs_source = args.action != action_id::ADD_DEFINITIONS_CURRENT_FILE;
+        let source_uri = if needs_source {
+            match self.matching_source(&path, &config).await {
+                Some(uri) => Some(uri),
+                None => {
+                    self.show_warning("No matching source file was found.")
+                        .await;
+                    return Ok(None);
+                }
+            }
+        } else {
+            None
+        };
+        let source_text = match &source_uri {
+            Some(uri) => Some(
+                self.file_text(uri)
+                    .await
+                    .ok_or_else(|| invalid("cannot read the matching source file"))?,
+            ),
+            None => None,
+        };
+        let source = source_text.as_ref().map(|s| FileInput {
+            text: &s.text,
             is_header: false,
-            is_c: source.is_c,
-        };
-        let Some(insertion) = add_definition::add_definition(
-            &decl,
-            args.position,
-            Target::MatchingSource,
-            Some(&target),
-            &config,
-        ) else {
-            self.show_warning("No undefined function declaration at the cursor.")
-                .await;
-            return Ok(None);
+            is_c: s.is_c,
+        });
+
+        let (target_uri, edits, cursor) = match args.action.as_str() {
+            action_id::ADD_DEFINITION_MATCHING_SOURCE | action_id::CONSTRUCTOR_MATCHING_SOURCE => {
+                let initializers = if args.action == action_id::CONSTRUCTOR_MATCHING_SOURCE {
+                    Initializers::All
+                } else {
+                    Initializers::None
+                };
+                let Some(insertion) = add_definition::add_definition_with(
+                    &decl,
+                    args.position,
+                    Target::MatchingSource,
+                    source.as_ref(),
+                    initializers,
+                    &config,
+                ) else {
+                    self.show_warning("No undefined function declaration at the cursor.")
+                        .await;
+                    return Ok(None);
+                };
+                (
+                    source_uri.clone().unwrap_or_else(|| args.uri.clone()),
+                    vec![TextEdit::new(insertion.range, insertion.new_text)],
+                    insertion.cursor,
+                )
+            }
+            action_id::ADD_DEFINITIONS_MATCHING_SOURCE
+            | action_id::ADD_DEFINITIONS_CURRENT_FILE => {
+                let (target, target_uri) =
+                    if args.action == action_id::ADD_DEFINITIONS_MATCHING_SOURCE {
+                        (
+                            BulkTarget::MatchingSource,
+                            source_uri.clone().unwrap_or_else(|| args.uri.clone()),
+                        )
+                    } else {
+                        (BulkTarget::CurrentFile, args.uri.clone())
+                    };
+                let Some(bulk) =
+                    add_definition::add_definitions(&decl, target, source.as_ref(), &config)
+                else {
+                    self.show_info("No undefined functions found in this file.")
+                        .await;
+                    return Ok(None);
+                };
+                (target_uri, bulk.edits, bulk.cursor)
+            }
+            other => return Err(invalid(&format!("unknown action: {other}"))),
         };
 
         let edit = WorkspaceEdit {
-            changes: Some(HashMap::from([(
-                source_uri.clone(),
-                vec![TextEdit::new(insertion.range, insertion.new_text)],
-            )])),
+            changes: Some(HashMap::from([(target_uri.clone(), edits)])),
             ..Default::default()
         };
         let applied = self
@@ -132,18 +202,21 @@ impl Backend {
             .await
             .is_ok_and(|response| response.applied);
         if applied && config.reveal_new_definition {
-            let cursor = Range::new(insertion.cursor, insertion.cursor);
             let _ = self
                 .client
                 .show_document(ShowDocumentParams {
-                    uri: source_uri,
+                    uri: target_uri,
                     external: Some(false),
                     take_focus: Some(true),
-                    selection: Some(cursor),
+                    selection: Some(Range::new(cursor, cursor)),
                 })
                 .await;
         }
         Ok(None)
+    }
+
+    async fn show_info(&self, message: &str) {
+        self.client.show_message(MessageType::INFO, message).await;
     }
 
     async fn show_warning(&self, message: &str) {
@@ -203,7 +276,10 @@ impl LanguageServer for Backend {
                     },
                 )),
                 execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: vec![COMMAND_ADD_DEFINITION_IN_SOURCE.into()],
+                    commands: vec![
+                        COMMAND_ADD_DEFINITION_IN_SOURCE.into(),
+                        COMMAND_APPLY_ACTION.into(),
+                    ],
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -277,7 +353,7 @@ impl LanguageServer for Backend {
             is_header,
             is_c: file.is_c,
         };
-        if !add_definition::has_declaration_at(&decl, position) {
+        if !add_definition::may_offer_actions_at(&decl, position) {
             return Ok(None);
         }
         let source_uri = match &path {
@@ -294,50 +370,84 @@ impl LanguageServer for Backend {
             is_c: s.is_c,
         });
 
-        let mut actions = Vec::new();
-        for target in add_definition::available_targets(&decl, position, source.as_ref()) {
-            let action = match target {
-                Target::MatchingSource => {
-                    let args = AddDefinitionArgs {
-                        uri: uri.clone(),
-                        position,
-                    };
-                    CodeAction {
-                        title: target.title().into(),
-                        kind: Some(CodeActionKind::REFACTOR),
-                        command: Some(Command {
-                            title: target.title().into(),
-                            command: COMMAND_ADD_DEFINITION_IN_SOURCE.into(),
-                            arguments: Some(vec![serde_json::to_value(args).unwrap_or_default()]),
-                        }),
-                        ..Default::default()
-                    }
-                }
-                Target::CurrentFile | Target::Inline => {
-                    let Some(insertion) = add_definition::add_definition(
-                        &decl,
-                        position,
-                        target,
-                        source.as_ref(),
-                        &config,
-                    ) else {
-                        continue;
-                    };
-                    CodeAction {
-                        title: target.title().into(),
-                        kind: Some(CodeActionKind::REFACTOR),
-                        edit: Some(WorkspaceEdit {
-                            changes: Some(HashMap::from([(
-                                uri.clone(),
-                                vec![TextEdit::new(insertion.range, insertion.new_text)],
-                            )])),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }
-                }
+        let command_action = |title: &str, action: &str| {
+            let args = ActionArgs {
+                uri: uri.clone(),
+                position,
+                action: action.into(),
             };
-            actions.push(CodeActionOrCommand::CodeAction(action));
+            CodeActionOrCommand::CodeAction(CodeAction {
+                title: title.into(),
+                kind: Some(CodeActionKind::REFACTOR),
+                command: Some(Command {
+                    title: title.into(),
+                    command: COMMAND_APPLY_ACTION.into(),
+                    arguments: Some(vec![serde_json::to_value(args).unwrap_or_default()]),
+                }),
+                ..Default::default()
+            })
+        };
+        let edit_action = |title: &str, insertion: add_definition::Insertion| {
+            CodeActionOrCommand::CodeAction(CodeAction {
+                title: title.into(),
+                kind: Some(CodeActionKind::REFACTOR),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(HashMap::from([(
+                        uri.clone(),
+                        vec![TextEdit::new(insertion.range, insertion.new_text)],
+                    )])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+
+        let targets = add_definition::available_targets(&decl, position, source.as_ref());
+        let constructor =
+            !targets.is_empty() && add_definition::offers_constructor_initializers(&decl, position);
+        let mut actions = Vec::new();
+        for (initializers, title_of) in [
+            (
+                Initializers::None,
+                Target::title as fn(Target) -> &'static str,
+            ),
+            (Initializers::All, Target::constructor_title),
+        ] {
+            if initializers == Initializers::All && !constructor {
+                continue;
+            }
+            for &target in &targets {
+                let title = title_of(target);
+                match target {
+                    Target::MatchingSource => {
+                        let id = if initializers == Initializers::All {
+                            action_id::CONSTRUCTOR_MATCHING_SOURCE
+                        } else {
+                            action_id::ADD_DEFINITION_MATCHING_SOURCE
+                        };
+                        actions.push(command_action(title, id));
+                    }
+                    Target::CurrentFile | Target::Inline => {
+                        if let Some(insertion) = add_definition::add_definition_with(
+                            &decl,
+                            position,
+                            target,
+                            source.as_ref(),
+                            initializers,
+                            &config,
+                        ) {
+                            actions.push(edit_action(title, insertion));
+                        }
+                    }
+                }
+            }
+        }
+        for target in add_definition::available_bulk_targets(&decl, position, source.as_ref()) {
+            let id = match target {
+                BulkTarget::MatchingSource => action_id::ADD_DEFINITIONS_MATCHING_SOURCE,
+                BulkTarget::CurrentFile => action_id::ADD_DEFINITIONS_CURRENT_FILE,
+            };
+            actions.push(command_action(target.title(), id));
         }
         Ok((!actions.is_empty()).then_some(actions))
     }
@@ -356,7 +466,21 @@ impl LanguageServer for Backend {
                     .next()
                     .and_then(|value| serde_json::from_value::<AddDefinitionArgs>(value).ok())
                     .ok_or_else(|| Error::invalid_params("expected {uri, position}"))?;
-                self.add_definition_in_source(args).await
+                self.run_action(ActionArgs {
+                    uri: args.uri,
+                    position: args.position,
+                    action: action_id::ADD_DEFINITION_MATCHING_SOURCE.into(),
+                })
+                .await
+            }
+            COMMAND_APPLY_ACTION => {
+                let args = params
+                    .arguments
+                    .into_iter()
+                    .next()
+                    .and_then(|value| serde_json::from_value::<ActionArgs>(value).ok())
+                    .ok_or_else(|| Error::invalid_params("expected {uri, position, action}"))?;
+                self.run_action(args).await
             }
             _ => Err(Error::invalid_params(format!(
                 "unknown command: {}",

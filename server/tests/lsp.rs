@@ -12,7 +12,7 @@ use tower_lsp_server::LspService;
 use tower_lsp_server::jsonrpc::{Request, Response};
 use tower_lsp_server::ls_types::Uri;
 
-use cmantic_ls::server::{Backend, COMMAND_ADD_DEFINITION_IN_SOURCE};
+use cmantic_ls::server::{Backend, COMMAND_ADD_DEFINITION_IN_SOURCE, COMMAND_APPLY_ACTION};
 
 struct TempDir(PathBuf);
 
@@ -152,7 +152,11 @@ async fn add_definition_in_matching_source_file() {
     let source_action = &actions[0];
     assert!(source_action.get("edit").is_none());
     let command = &source_action["command"];
-    assert_eq!(command["command"], COMMAND_ADD_DEFINITION_IN_SOURCE);
+    assert_eq!(command["command"], COMMAND_APPLY_ACTION);
+    assert_eq!(
+        command["arguments"][0]["action"],
+        "addDefinition.matchingSource"
+    );
     call(
         &mut service,
         request(
@@ -213,4 +217,264 @@ async fn add_definition_in_matching_source_file() {
     }
     assert!(methods.contains(&"workspace/applyEdit".to_string()));
     assert!(!methods.contains(&"window/showDocument".to_string()));
+
+    // The older dedicated command still works.
+    call(
+        &mut service,
+        request(
+            5,
+            "workspace/executeCommand",
+            json!({
+                "command": COMMAND_ADD_DEFINITION_IN_SOURCE,
+                "arguments": [{ "uri": header_uri, "position": { "line": 5, "character": 9 } }]
+            }),
+        ),
+    )
+    .await;
+    let mut methods = Vec::new();
+    while let Ok((method, _)) = sent_rx.try_recv() {
+        methods.push(method);
+    }
+    assert!(methods.contains(&"workspace/applyEdit".to_string()));
+}
+
+/// A server with a fake client that accepts every `workspace/applyEdit` and
+/// `window/showDocument` and records all requests and notifications it receives.
+struct Harness {
+    service: LspService<Backend>,
+    sent: mpsc::UnboundedReceiver<(String, Value)>,
+    next_id: i64,
+    dir: TempDir,
+}
+
+impl Harness {
+    async fn new(name: &str, files: &[(&str, &str)]) -> Self {
+        let dir = std::env::temp_dir().join(format!("cmantic-ls-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir(dir.canonicalize().unwrap());
+        for (path, text) in files {
+            let path = dir.0.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        let (service, socket) = LspService::new(Backend::new);
+        let (mut requests, mut responses) = socket.split();
+        let (sent_tx, sent) = mpsc::unbounded_channel::<(String, Value)>();
+        tokio::spawn(async move {
+            while let Some(message) = requests.next().await {
+                let (method, id, params) = message.into_parts();
+                let result = match method.as_ref() {
+                    "workspace/applyEdit" => json!({ "applied": true }),
+                    "window/showDocument" => json!({ "success": true }),
+                    _ => Value::Null,
+                };
+                let _ = sent_tx.send((method.to_string(), params.unwrap_or(Value::Null)));
+                if let Some(id) = id {
+                    let _ = responses.send(Response::from_ok(id, result)).await;
+                }
+            }
+        });
+        let mut harness = Self {
+            service,
+            sent,
+            next_id: 1,
+            dir,
+        };
+        let root = uri(&harness.dir.0);
+        harness
+            .request(
+                "initialize",
+                json!({ "capabilities": {}, "workspaceFolders": [{ "uri": root, "name": "p" }] }),
+            )
+            .await;
+        call(&mut harness.service, notification("initialized", json!({}))).await;
+        harness
+    }
+
+    fn uri(&self, path: &str) -> String {
+        uri(&self.dir.0.join(path))
+    }
+
+    async fn request(&mut self, method: &'static str, params: Value) -> Option<Value> {
+        self.next_id += 1;
+        call(&mut self.service, request(self.next_id, method, params)).await
+    }
+
+    async fn open(&mut self, path: &str) {
+        let text = fs::read_to_string(self.dir.0.join(path)).unwrap();
+        let uri = self.uri(path);
+        call(
+            &mut self.service,
+            notification(
+                "textDocument/didOpen",
+                json!({ "textDocument": { "uri": uri, "languageId": "cpp", "version": 1, "text": text } }),
+            ),
+        )
+        .await;
+    }
+
+    async fn actions(&mut self, path: &str, line: u32, character: u32) -> Vec<Value> {
+        let uri = self.uri(path);
+        let position = json!({ "line": line, "character": character });
+        self.request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": uri },
+                "range": { "start": position, "end": position },
+                "context": { "diagnostics": [] }
+            }),
+        )
+        .await
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+    }
+
+    async fn run(&mut self, action: &Value) -> Vec<(String, Value)> {
+        let command = &action["command"];
+        assert_eq!(command["command"], COMMAND_APPLY_ACTION, "{action}");
+        self.request(
+            "workspace/executeCommand",
+            json!({ "command": command["command"], "arguments": command["arguments"] }),
+        )
+        .await;
+        let mut sent = Vec::new();
+        while let Ok(message) = self.sent.try_recv() {
+            if message.0 != "window/logMessage" {
+                sent.push(message);
+            }
+        }
+        sent
+    }
+}
+
+fn find<'a>(actions: &'a [Value], title: &str) -> &'a Value {
+    actions
+        .iter()
+        .find(|a| a["title"] == title)
+        .unwrap_or_else(|| panic!("no action {title:?} in {actions:?}"))
+}
+
+fn titles(actions: &[Value]) -> Vec<&str> {
+    actions
+        .iter()
+        .map(|a| a["title"].as_str().unwrap())
+        .collect()
+}
+
+const BULK_HEADER: &str = "#pragma once\n\nclass Foo {\npublic:\n    Foo();\n    void a();\n    void b();\nprivate:\n    int& r;\n};\n";
+
+#[tokio::test]
+async fn add_all_missing_definitions_in_matching_source_file() {
+    let mut h = Harness::new(
+        "bulk-source",
+        &[("foo.h", BULK_HEADER), ("foo.cpp", "#include \"foo.h\"\n")],
+    )
+    .await;
+    h.open("foo.h").await;
+    // On the class name.
+    let actions = h.actions("foo.h", 2, 7).await;
+    assert_eq!(
+        titles(&actions),
+        vec![
+            "Add all missing definitions in matching source file",
+            "Add all missing definitions in this file"
+        ]
+    );
+    let sent = h
+        .run(find(
+            &actions,
+            "Add all missing definitions in matching source file",
+        ))
+        .await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[0].0, "workspace/applyEdit");
+    let source_uri = h.uri("foo.cpp");
+    assert_eq!(
+        sent[0].1["edit"]["changes"][&source_uri],
+        json!([{
+            "range": { "start": { "line": 0, "character": 16 }, "end": { "line": 0, "character": 16 } },
+            "newText": "\n\nFoo::Foo()\n    : r()\n{\n    \n}\n\nvoid Foo::a() {\n    \n}\n\nvoid Foo::b() {\n    \n}"
+        }])
+    );
+    assert_eq!(sent[1].0, "window/showDocument");
+    assert_eq!(sent[1].1["uri"], json!(source_uri));
+    assert_eq!(
+        sent[1].1["selection"]["start"],
+        json!({ "line": 3, "character": 8 })
+    );
+}
+
+#[tokio::test]
+async fn add_all_missing_definitions_in_this_file() {
+    let mut h = Harness::new("bulk-this", &[("foo.h", BULK_HEADER)]).await;
+    h.open("foo.h").await;
+    // On a declaration, with other undefined declarations around.
+    let actions = h.actions("foo.h", 5, 10).await;
+    assert_eq!(
+        titles(&actions),
+        vec![
+            "Add Definition in this file",
+            "Add Definition inline",
+            "Add all missing definitions in this file"
+        ]
+    );
+    let sent = h
+        .run(find(&actions, "Add all missing definitions in this file"))
+        .await;
+    let header_uri = h.uri("foo.h");
+    assert_eq!(sent[0].0, "workspace/applyEdit");
+    let edits = sent[0].1["edit"]["changes"][&header_uri]
+        .as_array()
+        .unwrap();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(
+        edits[0]["newText"],
+        "\n\ninline Foo::Foo()\n    : r()\n{\n    \n}\n\ninline void Foo::a() {\n    \n}\n\ninline void Foo::b() {\n    \n}"
+    );
+    assert_eq!(sent[1].0, "window/showDocument");
+    assert_eq!(sent[1].1["uri"], json!(header_uri));
+}
+
+#[tokio::test]
+async fn generate_constructor_initializing_all_members() {
+    let header =
+        "#pragma once\n\nstruct P : Base {\n    P(int x);\n    int a;\n    double b;\n};\n";
+    let mut h = Harness::new("ctor", &[("p.h", header), ("p.cpp", "#include \"p.h\"\n")]).await;
+    h.open("p.h").await;
+    let actions = h.actions("p.h", 3, 5).await;
+    assert_eq!(
+        titles(&actions),
+        vec![
+            "Add Definition in matching source file",
+            "Add Definition in this file",
+            "Add Definition inline",
+            "Generate Constructor in matching source file (initialize all members)",
+            "Generate Constructor in this file (initialize all members)",
+            "Generate Constructor inline (initialize all members)",
+        ]
+    );
+    let inline = find(
+        &actions,
+        "Generate Constructor inline (initialize all members)",
+    );
+    assert_eq!(
+        inline["edit"]["changes"][&h.uri("p.h")][0]["newText"],
+        "\n        : Base(),\n          a(),\n          b()\n    {\n        \n    }"
+    );
+    let sent = h
+        .run(find(
+            &actions,
+            "Generate Constructor in matching source file (initialize all members)",
+        ))
+        .await;
+    let source_uri = h.uri("p.cpp");
+    assert_eq!(
+        sent[0].1["edit"]["changes"][&source_uri][0]["newText"],
+        "\n\nP::P(int x)\n    : Base(),\n      a(),\n      b()\n{\n    \n}"
+    );
+    assert_eq!(
+        sent[1].1["selection"]["start"],
+        json!({ "line": 3, "character": 11 })
+    );
 }

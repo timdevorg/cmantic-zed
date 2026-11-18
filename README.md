@@ -19,7 +19,9 @@ The Zed extension downloads `cmantic-ls` from this repo's GitHub releases and st
 
 | Feature | Status |
 |---|---|
-| Add Definition (matching source file / this file / inline) | done (no constructor initializer prompt, no bulk "Add Definitions...") |
+| Add Definition (matching source file / this file / inline) | done |
+| Add all missing definitions (matching source file / this file) | done |
+| Generate Constructor with member initializers | done (all members, no picker) |
 | Add Declaration | planned |
 | Generate Getters and Setters | planned |
 | Generate equality, relational and stream output operators | planned |
@@ -67,7 +69,47 @@ are dropped, and multi-line parameter lists keep their alignment.
 Nothing is offered for pure virtual, `= default` and `= delete` functions, or when a
 definition already exists in the file or its matching source file.
 
-Constructors get an empty body; C-Mantic's prompt for member initializers is not ported.
+### Constructors
+
+On a constructor declaration of a class with base classes or non-static data members, the
+menu additionally offers **Generate Constructor in matching source file / in this file /
+inline (initialize all members)**. They add a member initializer list with every base class
+followed by every non-static data member, in declaration order, and put the cursor in the
+first initializer:
+
+```cpp
+Foo::Foo(int x)
+    : Base(),
+      count(),
+      name()
+{
+}
+```
+
+`cpp.bracedInitialization` switches `()` to `{}`. C-Mantic instead asks which initializers
+to use (including a delegating constructor); Zed has no multi-select picker, so this port
+always initializes everything (delete what you don't need). The plain Add Definition actions
+still give constructors an empty body.
+
+## Add all missing definitions
+
+Adds definitions for every function declaration in the file that has none, in one edit:
+
+- **Add all missing definitions in matching source file**: skips declarations that must
+  stay in the header (`inline`, `constexpr`, `consteval`, templates); use the "in this
+  file" variant for those.
+- **Add all missing definitions in this file**.
+
+Offered when the cursor is on a class or struct head (its name, base list, ... but not its
+body) and the file has at least one undefined declaration, or on an undefined declaration
+when the file has at least two (for a single one, the Add Definition actions do the same).
+Definitions are added in declaration order and placed like single ones, so a definition
+follows the one just added for the previous declaration. Constructors get initializers only
+for members that require them (references and `const` members without a default member
+initializer). The cursor moves into the first new body when `revealNewDefinition` is on.
+
+C-Mantic shows a picker to choose functions and the target file; this port always adds all
+of them.
 
 ## Settings
 
@@ -81,7 +123,10 @@ Server settings go under `lsp.cmantic.settings` (the same keys are accepted in
       "settings": {
         "headerExtensions": ["h", "hpp", "hh", "hxx"],
         "sourceExtensions": ["c", "cpp", "cc", "cxx"],
-        "cpp": { "curlyBraceFormat": { "function": "newLineCtorDtor" } },
+        "cpp": {
+          "curlyBraceFormat": { "function": "newLineCtorDtor" },
+          "bracedInitialization": false
+        },
         "c": { "curlyBraceFormat": { "function": "newLine" } },
         "revealNewDefinition": true
       }
@@ -94,7 +139,8 @@ Server settings go under `lsp.cmantic.settings` (the same keys are accepted in
 |---|---|
 | `headerExtensions`, `sourceExtensions` | File extensions (without the dot) used to tell headers and source files apart and to find the matching file. |
 | `cpp.curlyBraceFormat.function`, `c.curlyBraceFormat.function` | Where the opening brace of a new function goes: `"newLine"`, `"sameLine"`, or `"newLineCtorDtor"` (new line for constructors and destructors only). The language of the file that receives the definition decides which one applies. |
-| `revealNewDefinition` | After adding a definition to the matching source file, open it with the cursor in the new body. |
+| `cpp.bracedInitialization` | Use `member{}` instead of `member()` in generated constructor initializer lists. |
+| `revealNewDefinition` | After adding a definition to the matching source file, or adding all missing definitions, open the file with the cursor in the (first) new body. |
 
 Indentation is detected from the file being edited (4 spaces if it has none).
 

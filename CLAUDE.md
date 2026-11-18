@@ -18,13 +18,24 @@ Port of the C-Mantic VS Code extension to Zed, as a language server plus a thin 
   - `symbol.rs`: tree-sitter symbol tree (namespaces, classes, functions, other) with scopes,
     template statements, params, specifier ranges. Replaces clangd document symbols;
     declarations are matched to definitions by qualified name + normalized param types + const/ref.
+    Classes carry `ClassInfo` (class/struct/union key, base classes, access specifier labels;
+    `Symbol::access_at`), variable declarations carry `VariableInfo` per declarator
+    (static/const/reference/pointer/array/default initializer; `Symbol::non_static_member_variables`).
+  - `edit_buffer.rs`: `EditBuffer` applies successive edits to an in-memory copy and turns them
+    back into non-overlapping edits against the original. Multi-step refactorings apply a change,
+    re-parse `buffer.text()`, compute the next change, then send `buffer.edits()` in one applyEdit.
   - `placement.rs`: `findSmartPositionForFunctionDefinition` and `formatTextToInsert` ports.
   - `header_source.rs`: matching header/source search and cache (`HeaderSourceCache.ts`).
-  - `actions/add_definition.rs`: Add Definition, pure text in -> `Insertion` out (incl. `formatDeclaration`).
-  - `server.rs`: LSP wiring. "Matching source file" is a command (`cmantic.addDefinitionInSourceFile`)
-    that sends `workspace/applyEdit` then `window/showDocument`; the other actions carry an `edit`.
-  - Tests: `server/tests/add_definition.rs` (fixtures, `@` = cursor), `header_source.rs` (temp dirs),
-    `lsp.rs` (end-to-end through `LspService` with a fake client).
+  - `actions/add_definition.rs`: Add Definition, pure text in -> `Insertion` out (incl. `formatDeclaration`),
+    constructor initializer lists (`Initializers`), and "Add all missing definitions" (`add_definitions`,
+    built on `EditBuffer`).
+  - `server.rs`: LSP wiring. Actions that edit another file or need a cursor move are commands:
+    `cmantic.applyAction` with `{uri, position, action}` (ids in `server::action_id`); executing it
+    recomputes the action, sends `workspace/applyEdit`, then `window/showDocument`. The older
+    `cmantic.addDefinitionInSourceFile` is still accepted. Same-file single edits carry an `edit`.
+  - Tests: `server/tests/add_definition.rs`, `add_definitions.rs` (fixtures, `@` = cursor, plus an
+    every-offset no-panic test), `header_source.rs` (temp dirs), `lsp.rs` (end-to-end through
+    `LspService`; `Harness` sets up a temp project and a fake client that records applyEdit/showDocument).
 - `reference/vscode-cmantic/`: original C-Mantic TypeScript source (MIT). Git-ignored, read-only reference.
   `src/commands/addDefinition.ts`, `src/CSymbol.ts` and `src/SourceDocument.ts` hold the Add Definition logic.
 
