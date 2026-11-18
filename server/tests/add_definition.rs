@@ -445,12 +445,40 @@ fn current_file_inside_header_guard() {
 }
 
 #[test]
-fn current_file_free_function_in_namespace_has_no_inline() {
-    // Matches C-Mantic: the definition lands inside the parent namespace, so no `inline`.
+fn current_file_free_function_in_namespace_gets_inline() {
+    // Unlike C-Mantic: a header definition inside a namespace block still needs `inline`.
     let header = "namespace ns {\nvoid f@();\n}\n";
     assert_eq!(
         Case::new(header).run(Target::CurrentFile),
-        "namespace ns {\nvoid f();\n\nvoid f() {\n    @\n}\n}\n"
+        "namespace ns {\nvoid f();\n\ninline void f() {\n    @\n}\n}\n"
+    );
+    let header = "namespace a {\nnamespace b {\nint g@(int x);\n}\n}\n";
+    assert_eq!(
+        Case::new(header).run(Target::CurrentFile),
+        "namespace a {\nnamespace b {\nint g(int x);\n\ninline int g(int x) {\n    @\n}\n}\n}\n"
+    );
+}
+
+#[test]
+fn current_file_already_inline_or_constexpr_in_namespace() {
+    let header = "namespace ns {\ninline void f@();\n}\n";
+    assert_eq!(
+        Case::new(header).run(Target::CurrentFile),
+        "namespace ns {\ninline void f();\n\ninline void f() {\n    @\n}\n}\n"
+    );
+    let header = "namespace ns {\nconstexpr int f@();\n}\n";
+    assert_eq!(
+        Case::new(header).run(Target::CurrentFile),
+        "namespace ns {\nconstexpr int f();\n\nconstexpr int f() {\n    @\n}\n}\n"
+    );
+}
+
+#[test]
+fn current_file_member_in_namespace_after_class_gets_inline() {
+    let header = "namespace ns {\nstruct S {\n    void f@();\n};\n}\n";
+    assert_eq!(
+        Case::new(header).run(Target::CurrentFile),
+        "namespace ns {\nstruct S {\n    void f();\n};\n\ninline void S::f() {\n    @\n}\n}\n"
     );
 }
 

@@ -285,14 +285,26 @@ fn format_definition(
     scope_string.push_str(&old_scope.split_whitespace().collect::<String>());
 
     let inline_specifier = {
-        let outside_parent = path
-            .parent
-            .is_none_or(|p| !(p.range.start < position.offset && position.offset < p.range.end))
-            || !same_file;
+        let inside_parent = same_file
+            && path
+                .parent
+                .is_some_and(|p| p.range.start < position.offset && position.offset < p.range.end);
+        // In a header, only a definition inside the class body is implicitly inline. A
+        // definition inside a namespace block still needs `inline` to avoid multiple-definition
+        // link errors (C-Mantic skipped it there).
+        let inside_class = inside_parent
+            && symbol
+                .parent_scope()
+                .is_some_and(|s| s.kind == ScopeKind::Class);
+        let needs_inline = if target.is_header {
+            !inside_class
+        } else {
+            same_file && !inside_parent
+        };
         let already = ["inline", "constexpr", "consteval"]
             .iter()
             .any(|w| leading_text_has(text, symbol, w));
-        if outside_parent && (same_file || target.is_header) && !already {
+        if needs_inline && !already {
             "inline "
         } else {
             ""

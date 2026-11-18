@@ -53,7 +53,8 @@ Put the cursor on a function declaration that has no definition yet and press `c
   `constexpr`, `consteval` or template functions, which must stay in the header. The new
   definition is opened with the cursor inside its body.
 - **Add Definition in this file**: after the class or next to related definitions. In a
-  header the definition gets `inline`.
+  header the definition gets `inline` unless it is already `inline`/`constexpr`/`consteval`
+  (also when it lands inside a namespace block, which C-Mantic missed).
 - **Add Definition inline**: for class members, turns the declaration into a definition
   inside the class.
 
