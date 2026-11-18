@@ -34,7 +34,16 @@ Port of the C-Mantic VS Code extension to Zed, as a language server plus a thin 
     body, `DefinitionLocation`, optional neighbour) to a class: declaration or inline definition into the
     class (adding `public:` when needed), out-of-line definitions via `add_definition::definition_text`
     below the class or into the matching source file. Re-parses after every insertion (EditBuffer);
-    `finish()` gives a `GeneratedEdit` (edits for the header and the source file, source cursor).
+    `finish()` gives a `GeneratedEdit` (`edits` for the current file, `other_edits`/`other_cursor` for the
+    matching header/source file).
+  - `actions/add_declaration.rs`: Add Declaration (`addDeclaration.ts`): member definitions into their
+    class (via `ClassEditor`, `compact`), free functions into the matching header (namespace blocks
+    added when missing) or the same file (before first use). `definition_at` (cursor on a definition
+    head), `find_parent_class`, `member_declaration_text`, `neighbour_declaration` are shared with
+    Move Definition.
+  - `add_definition::format_head` formats any function head (declaration or definition, `HeadKind`) for a
+    target position given the target's enclosing scopes; explicit qualifiers (`Foo<T>::`) count as
+    scopes, so qualifiers the target is inside are dropped and their template statements with them.
   - `actions/accessors.rs`: Generate Getter/Setter (`Accessor.ts`, naming from `CSymbol.ts`), built on
     `ClassEditor`. Types judged by syntax only (`VariableInfo::leading_text`).
   - `actions/operators.rs`: Generate Equality / Relational / Stream Output Operators (`Operator.ts`),
@@ -42,9 +51,10 @@ Port of the C-Mantic VS Code extension to Zed, as a language server plus a thin 
   - `actions/mod.rs`: `may_offer_actions_at`, the cheap gate in `code_action`.
   - `server.rs`: LSP wiring. Actions that edit another file or need a cursor move are commands:
     `cmantic.applyAction` with `{uri, position, action}` (ids in `server::action_id`); executing it
-    recomputes the action, sends `workspace/applyEdit`, then `window/showDocument` (one applyEdit may change the header and its source file). The older
+    recomputes the action (with `matching_file`: the source of a header or the header of a source
+    file), sends `workspace/applyEdit`, then `window/showDocument` (one applyEdit may change the header and its source file). The older
     `cmantic.addDefinitionInSourceFile` is still accepted. Same-file single edits carry an `edit`.
-  - Tests: `server/tests/add_definition.rs`, `add_definitions.rs`, `accessors.rs`, `operators.rs` (fixtures, `@` = cursor, plus an
+  - Tests: `server/tests/add_definition.rs`, `add_definitions.rs`, `add_declaration.rs`, `accessors.rs`, `operators.rs` (fixtures, `@` = cursor, plus an
     every-offset no-panic test), `header_source.rs` (temp dirs), `lsp.rs` (end-to-end through
     `LspService`; `Harness` sets up a temp project and a fake client that records applyEdit/showDocument).
 - `reference/vscode-cmantic/`: original C-Mantic TypeScript source (MIT). Git-ignored, read-only reference.

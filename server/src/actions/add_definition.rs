@@ -7,7 +7,7 @@ use tower_lsp_server::ls_types::{Position, Range, TextEdit};
 use crate::config::Config;
 use crate::edit_buffer::EditBuffer;
 use crate::placement::{ProposedPosition, find_position_for_definition, format_text_to_insert};
-use crate::symbol::{ScopeKind, Symbol, SymbolPath, SymbolTree, dedent, leading_text_has};
+use crate::symbol::{Scope, ScopeKind, Symbol, SymbolPath, SymbolTree, dedent, leading_text_has};
 use crate::text::{
     detect_eol, detect_indentation, leading_whitespace, line_start, offset_to_position,
     position_to_offset, remove_word_and_leading_space, remove_word_and_trailing_space,
@@ -642,55 +642,173 @@ fn format_definition(
     position: &ProposedPosition,
     same_file: bool,
 ) -> String {
-    let text = decl.text;
-    let symbol = path.symbol();
-    let func = symbol.function.as_ref().expect("declaration is a function");
+    format_head(
+        decl.text,
+        path,
+        target,
+        &target_tree.scopes_at(position.offset),
+        position.offset,
+        same_file,
+        HeadKind::Definition,
+    )
+}
 
-    // Scope qualifiers, omitting the scopes that the target position is already inside.
-    let scopes: Vec<_> = symbol
+/// What [`format_head`] produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadKind {
+    /// A definition head: `inline` is added where needed (`checkForInline`).
+    Definition,
+    /// A declaration head (without `;`): `inline` is removed. `static` is removed unless
+    /// `keep_static` (forward declarations of internal functions in the same file).
+    Declaration { keep_static: bool },
+}
+
+/// A namespace or class qualifying a function: an enclosing scope or an explicit qualifier
+/// (`Foo<T>::` in `void Foo<T>::f()`).
+struct ScopeEntry {
+    name: String,
+    /// What to write before `::`.
+    text: String,
+    /// `None` for explicit qualifiers (it isn't known whether they name a class or namespace).
+    kind: Option<ScopeKind>,
+    /// Template statement that the qualified function needs for this scope.
+    template: Option<String>,
+    anonymous: bool,
+}
+
+/// Splits explicit qualifiers (`ns::Foo<A::B>::`, whitespace removed) at top-level `::`.
+fn split_qualifiers(scope: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut current = String::new();
+    let mut chars = scope.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 && chars.peek() == Some(&':') => {
+                chars.next();
+                parts.push(std::mem::take(&mut current));
+                continue;
+            }
+            _ => {}
+        }
+        current.push(c);
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
+/// The scopes qualifying `symbol` (enclosing ones, then explicit qualifiers) and the
+/// function's own template statements (those not consumed by templated explicit qualifiers).
+fn scope_entries(text: &str, symbol: &Symbol) -> (Vec<ScopeEntry>, Vec<String>) {
+    let func = symbol.function.as_ref().expect("symbol is a function");
+    let mut entries: Vec<ScopeEntry> = symbol
         .scopes
         .iter()
         .filter(|s| !func.is_friend || s.kind == ScopeKind::Namespace)
+        .map(|s| ScopeEntry {
+            name: s.name.clone(),
+            text: s.qualifier.clone(),
+            kind: Some(s.kind),
+            template: s.template.clone().filter(|_| s.kind == ScopeKind::Class),
+            anonymous: s.is_anonymous(),
+        })
         .collect();
-    let target_scopes = target_tree.scopes_at(position.offset);
-    let common = scopes
-        .iter()
-        .zip(&target_scopes)
-        .take_while(|(a, b)| a.kind == b.kind && a.name == b.name)
-        .count();
-    let mut scope_string: String = scopes[common..]
-        .iter()
-        .filter(|s| !s.is_anonymous())
-        .map(|s| format!("{}::", s.qualifier))
+    let old_scope: String = text[func.scope_start..func.name_range.start]
+        .split_whitespace()
         .collect();
-    let old_scope = &text[func.scope_start..func.name_range.start];
-    scope_string.push_str(&old_scope.split_whitespace().collect::<String>());
-
-    let inline_specifier = {
-        let inside_parent = same_file
-            && path
-                .parent
-                .is_some_and(|p| p.range.start < position.offset && position.offset < p.range.end);
-        // In a header, only a definition inside the class body is implicitly inline. A
-        // definition inside a namespace block still needs `inline` to avoid multiple-definition
-        // link errors (C-Mantic skipped it there).
-        let inside_class = inside_parent
-            && symbol
-                .parent_scope()
-                .is_some_and(|s| s.kind == ScopeKind::Class);
-        let needs_inline = if target.is_header {
-            !inside_class
+    let segments = split_qualifiers(&old_scope);
+    // Template statements of an out-of-line member definition (`template <class T> void
+    // Foo<T>::f()`) belong to the templated qualifiers first.
+    let templated = segments.iter().filter(|s| s.contains('<')).count();
+    let mut own = func.templates.clone();
+    let mut class_templates = Vec::new();
+    if templated > 0 && templated <= own.len() {
+        class_templates = own.drain(..templated).collect();
+    }
+    let mut class_templates = class_templates.into_iter();
+    for segment in segments {
+        let template = if segment.contains('<') {
+            class_templates.next()
         } else {
-            same_file && !inside_parent
+            None
         };
-        let already = ["inline", "constexpr", "consteval"]
-            .iter()
-            .any(|w| leading_text_has(text, symbol, w));
-        if needs_inline && !already {
-            "inline "
-        } else {
-            ""
+        let name = segment.split('<').next().unwrap_or("").to_string();
+        entries.push(ScopeEntry {
+            name,
+            text: segment,
+            kind: None,
+            template,
+            anonymous: false,
+        });
+    }
+    (entries, own)
+}
+
+/// Formats the function at `path` (a declaration or a definition, in `text`) as a head for
+/// `offset` in `target`, whose enclosing scopes are `target_scopes`: scope qualifiers are
+/// added for the scopes the position isn't inside, default arguments and specifiers that are
+/// only valid in a declaration are removed and multi-line declarations are re-aligned.
+/// No body or `;`. Uses `\n` line endings.
+pub(crate) fn format_head(
+    text: &str,
+    path: SymbolPath,
+    target: &FileInput,
+    target_scopes: &[Scope],
+    offset: usize,
+    same_file: bool,
+    kind: HeadKind,
+) -> String {
+    let symbol = path.symbol();
+    let func = symbol.function.as_ref().expect("symbol is a function");
+
+    // Scope qualifiers, omitting the scopes that the target position is already inside.
+    let (entries, own_templates) = scope_entries(text, symbol);
+    let common = entries
+        .iter()
+        .zip(target_scopes)
+        .take_while(|(a, b)| {
+            a.kind.is_none_or(|k| k == b.kind)
+                && a.name == b.name
+                && !(a.kind.is_none() && a.name.is_empty())
+        })
+        .count();
+    let scope_string: String = entries[common..]
+        .iter()
+        .filter(|s| !s.anonymous)
+        .map(|s| format!("{}::", s.text))
+        .collect();
+
+    let target_in_class = target_scopes
+        .last()
+        .is_some_and(|s| s.kind == ScopeKind::Class);
+    let already_inline = ["inline", "constexpr", "consteval"]
+        .iter()
+        .any(|w| leading_text_has(text, symbol, w));
+    let inline_specifier = match kind {
+        HeadKind::Definition if !target_in_class && !already_inline => {
+            let inside_parent = same_file
+                && path
+                    .parent
+                    .is_some_and(|p| p.range.start < offset && offset < p.range.end);
+            // In a header, only a definition inside the class body is implicitly inline. A
+            // definition inside a namespace block still needs `inline` to avoid
+            // multiple-definition link errors (C-Mantic skipped it there).
+            let inside_class = inside_parent
+                && symbol
+                    .parent_scope()
+                    .is_some_and(|s| s.kind == ScopeKind::Class);
+            let needs_inline = if target.is_header {
+                !inside_class
+            } else {
+                same_file && !inside_parent
+            };
+            if needs_inline { "inline " } else { "" }
         }
+        _ => "",
     };
 
     // Text before the name (return type and specifiers). Continuation lines of the declaration
@@ -698,10 +816,13 @@ fn format_definition(
     let new_line_alignment = func.name_range.start - line_start(text, func.name_range.start);
 
     let mut leading = text[func.decl_start..func.scope_start].replace("\r\n", "\n");
+    let keep_static = matches!(kind, HeadKind::Declaration { keep_static: true });
     for word in ["virtual", "static", "explicit", "friend"] {
-        leading = remove_word_and_trailing_space(&leading, word, false);
+        if !(word == "static" && keep_static) {
+            leading = remove_word_and_trailing_space(&leading, word, false);
+        }
     }
-    if !target.is_header {
+    if !target.is_header || matches!(kind, HeadKind::Declaration { .. }) {
         leading = remove_word_and_trailing_space(&leading, "inline", true);
     }
     let true_start_indent = leading_whitespace(&text[line_start(text, symbol.range.start)..]);
@@ -739,17 +860,14 @@ fn format_definition(
         definition = definition.replace(&old, &new);
     }
 
-    // Template statements of enclosing class templates, then the function's own.
+    // Template statements of enclosing class templates the position isn't inside, then the
+    // function's own.
     let mut templates = String::new();
-    for scope in &scopes {
-        if scope.kind == ScopeKind::Class
-            && let Some(template) = &scope.template
-        {
-            templates.push_str(template);
-            templates.push('\n');
-        }
-    }
-    for template in &func.templates {
+    for template in entries[common..]
+        .iter()
+        .filter_map(|e| e.template.as_ref())
+        .chain(&own_templates)
+    {
         templates.push_str(template);
         templates.push('\n');
     }

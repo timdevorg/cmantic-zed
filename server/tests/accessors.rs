@@ -80,11 +80,11 @@ fn run_with(
         config,
     )
     .expect("an edit");
-    let new_source = (!generated.source_edits.is_empty()).then(|| {
+    let new_source = (!generated.other_edits.is_empty()).then(|| {
         apply(
             source.unwrap(),
-            &generated.source_edits,
-            generated.source_cursor,
+            &generated.other_edits,
+            generated.other_cursor,
         )
     });
     (apply(&text, &generated.edits, None), new_source)

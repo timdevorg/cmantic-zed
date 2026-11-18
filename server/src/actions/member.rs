@@ -30,15 +30,17 @@ pub(crate) struct NewMember {
     pub relative: Option<(String, Side)>,
 }
 
-/// Edits to the current file and (optionally) its matching source file.
+/// Edits to the current file and (optionally) its matching header/source file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GeneratedEdit {
-    /// Edits to the file containing the class, against its original text.
+    /// Edits to the current file (for the class editor: the file containing the class),
+    /// against its original text.
     pub edits: Vec<TextEdit>,
-    /// Edits to the matching source file, against its original text (empty if unchanged).
-    pub source_edits: Vec<TextEdit>,
-    /// Cursor in the matching source file after the edits: inside the first new definition.
-    pub source_cursor: Option<Position>,
+    /// Edits to the matching file (the source file of a header, or the header of a source
+    /// file), against its original text (empty if unchanged).
+    pub other_edits: Vec<TextEdit>,
+    /// Cursor in the matching file after the edits (e.g. inside the first new definition).
+    pub other_cursor: Option<Position>,
 }
 
 pub(crate) struct ClassEditor<'a> {
@@ -46,10 +48,12 @@ pub(crate) struct ClassEditor<'a> {
     buffer: EditBuffer,
     unit: String,
     source: Option<(FileInput<'a>, EditBuffer, String)>,
-    source_cursor: Option<usize>,
+    other_cursor: Option<usize>,
     /// Start of the class symbol; edits only go into its body or after it.
     class_start: usize,
     config: &'a Config,
+    /// Don't separate new members from their neighbours with blank lines (declarations).
+    pub compact: bool,
 }
 
 /// The class (or struct/union) symbol starting at `start`.
@@ -75,10 +79,11 @@ impl<'a> ClassEditor<'a> {
             source: source
                 .filter(|_| file.is_header)
                 .map(|s| (s, EditBuffer::new(s.text), indent_unit(s.text, file.text))),
-            source_cursor: None,
+            other_cursor: None,
             class_start,
             file,
             config,
+            compact: false,
         }
     }
 
@@ -91,7 +96,8 @@ impl<'a> ClassEditor<'a> {
             .relative
             .as_ref()
             .map(|(n, side)| (n.as_str(), *side));
-        let position = find_position_for_new_member_function(&text, class, relative);
+        let mut position = find_position_for_new_member_function(&text, class, relative);
+        position.next_to |= self.compact;
 
         let mut insert = match member.location {
             DefinitionLocation::Inline => member.inline_text.clone(),
@@ -171,10 +177,10 @@ impl<'a> ClassEditor<'a> {
                 let cursor = definition.cursor
                     + (eol.len() - 1) * definition.text[..definition.cursor].matches('\n').count();
                 let new_text = with_eol(definition.text, eol);
-                match self.source_cursor.as_mut() {
+                match self.other_cursor.as_mut() {
                     Some(c) if definition.offset <= *c => *c += new_text.len(),
                     Some(_) => {}
-                    None => self.source_cursor = Some(definition.offset + cursor),
+                    None => self.other_cursor = Some(definition.offset + cursor),
                 }
                 buffer.insert(definition.offset, &new_text);
             }
@@ -204,17 +210,17 @@ impl<'a> ClassEditor<'a> {
     }
 
     pub fn finish(self) -> GeneratedEdit {
-        let (source_edits, source_cursor) = match &self.source {
+        let (other_edits, other_cursor) = match &self.source {
             Some((_, buffer, _)) if buffer.is_changed() => (
                 buffer.edits(),
-                self.source_cursor.map(|c| buffer.position(c)),
+                self.other_cursor.map(|c| buffer.position(c)),
             ),
             _ => (Vec::new(), None),
         };
         GeneratedEdit {
             edits: self.buffer.edits(),
-            source_edits,
-            source_cursor,
+            other_edits,
+            other_cursor,
         }
     }
 }

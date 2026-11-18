@@ -37,7 +37,7 @@ fn run_with(text: &str, kind: OperatorKind, config: &Config) -> String {
         config,
     )
     .expect("an edit");
-    assert!(generated.source_edits.is_empty());
+    assert!(generated.other_edits.is_empty());
     let mut result = text.clone();
     for edit in generated.edits.iter().rev() {
         let start = position_to_offset(&text, edit.range.start);

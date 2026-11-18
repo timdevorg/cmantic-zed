@@ -232,6 +232,12 @@ impl Symbol {
         access
     }
 
+    pub fn is_function_definition(&self) -> bool {
+        self.function
+            .as_ref()
+            .is_some_and(FunctionInfo::is_definition)
+    }
+
     pub fn is_function_declaration(&self) -> bool {
         self.function
             .as_ref()
@@ -335,6 +341,53 @@ impl SymbolTree {
             let symbol = stack.pop()?;
             stack.extend(symbol.children.iter().rev());
             Some(symbol)
+        })
+    }
+
+    /// Depth-first iterator over all symbols with their parents and siblings.
+    pub fn paths(&self) -> impl Iterator<Item = SymbolPath<'_>> {
+        let mut stack: Vec<SymbolPath> = (0..self.symbols.len())
+            .rev()
+            .map(|index| SymbolPath {
+                parent: None,
+                siblings: &self.symbols,
+                index,
+            })
+            .collect();
+        std::iter::from_fn(move || {
+            let path = stack.pop()?;
+            let symbol = path.symbol();
+            stack.extend((0..symbol.children.len()).rev().map(|index| SymbolPath {
+                parent: Some(symbol),
+                siblings: &symbol.children,
+                index,
+            }));
+            Some(path)
+        })
+    }
+
+    /// Finds a function declaration (without a body) matching the definition `def` (which may
+    /// live in another file).
+    pub fn find_declaration(&self, def: &Symbol) -> Option<SymbolPath<'_>> {
+        self.paths().find(|p| {
+            let s = p.symbol();
+            s.is_function_declaration() && s.matches_function(def)
+        })
+    }
+
+    /// Finds the class, struct or union (with a body) whose name path (enclosing scopes plus
+    /// its own name) is `path`.
+    pub fn find_class(&self, path: &[String]) -> Option<SymbolPath<'_>> {
+        self.paths().find(|p| {
+            let s = p.symbol();
+            s.class.is_some()
+                && !s.name.is_empty()
+                && s.scopes.len() + 1 == path.len()
+                && s.scopes
+                    .iter()
+                    .map(|scope| &scope.name)
+                    .chain(std::iter::once(&s.name))
+                    .eq(path.iter())
         })
     }
 

@@ -11,6 +11,7 @@ use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer};
 
 use crate::actions::accessors::{self, AccessorKind};
+use crate::actions::add_declaration::{self, DeclarationTarget};
 use crate::actions::add_definition::{self, BulkTarget, FileInput, Initializers, Target};
 use crate::actions::member::GeneratedEdit;
 use crate::actions::operators;
@@ -35,6 +36,15 @@ pub mod action_id {
     pub const GENERATE_GETTER_SETTER: &str = "generateGetterSetter";
     pub const GENERATE_GETTER: &str = "generateGetter";
     pub const GENERATE_SETTER: &str = "generateSetter";
+    pub const ADD_DECLARATION_MATCHING_HEADER: &str = "addDeclaration.matchingHeader";
+    pub const ADD_DECLARATION_CLASS: &str = "addDeclaration.class";
+}
+
+fn declaration_action_id(target: DeclarationTarget) -> &'static str {
+    match target {
+        DeclarationTarget::MatchingHeader => action_id::ADD_DECLARATION_MATCHING_HEADER,
+        _ => action_id::ADD_DECLARATION_CLASS,
+    }
 }
 
 fn accessor_action_id(kind: AccessorKind) -> &'static str {
@@ -108,8 +118,10 @@ impl Backend {
         Some(FileText { text, is_c })
     }
 
-    async fn matching_source(&self, path: &Path, config: &Config) -> Option<Uri> {
-        if !config.is_header(&path.to_string_lossy()) {
+    /// The matching source file of a header, or the matching header of a source file.
+    async fn matching_file(&self, path: &Path, config: &Config) -> Option<Uri> {
+        let name = path.to_string_lossy();
+        if !config.is_header(&name) && !config.is_source(&name) {
             return None;
         }
         let roots = self.roots.read().await.clone();
@@ -140,35 +152,37 @@ impl Backend {
             is_c: file.is_c,
         };
 
-        let source_uri = self.matching_source(&path, &config).await;
-        let source_text = match &source_uri {
+        // The matching source file of a header, or the matching header of a source file.
+        let other_uri = self.matching_file(&path, &config).await;
+        let other_text = match &other_uri {
             Some(uri) => Some(
                 self.file_text(uri)
                     .await
-                    .ok_or_else(|| invalid("cannot read the matching source file"))?,
+                    .ok_or_else(|| invalid("cannot read the matching header/source file"))?,
             ),
             None => None,
         };
-        let source = source_text.as_ref().map(|s| FileInput {
+        let other = other_text.as_ref().map(|s| FileInput {
             text: &s.text,
-            is_header: false,
+            is_header: !is_header,
             is_c: s.is_c,
         });
+        let source = other.filter(|_| is_header);
+        let header = other.filter(|_| !is_header);
         let needs_source = matches!(
             args.action.as_str(),
             action_id::ADD_DEFINITION_MATCHING_SOURCE
                 | action_id::CONSTRUCTOR_MATCHING_SOURCE
                 | action_id::ADD_DEFINITIONS_MATCHING_SOURCE
         );
-        let source_uri = match source_uri {
-            Some(uri) => Some(uri),
-            None if needs_source => {
-                self.show_warning("No matching source file was found.")
-                    .await;
-                return Ok(None);
-            }
-            None => None,
-        };
+        let needs_header = args.action == action_id::ADD_DECLARATION_MATCHING_HEADER;
+        if needs_source && source.is_none() || needs_header && header.is_none() {
+            let kind = if needs_header { "header" } else { "source" };
+            self.show_warning(&format!("No matching {kind} file was found."))
+                .await;
+            return Ok(None);
+        }
+        let source_uri = other_uri.clone().filter(|_| is_header);
 
         // Edits per file, and where to put the cursor afterwards.
         let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
@@ -218,6 +232,25 @@ impl Backend {
                 };
                 changes.insert(target_uri.clone(), bulk.edits);
                 Some((target_uri, bulk.cursor))
+            }
+            action_id::ADD_DECLARATION_MATCHING_HEADER | action_id::ADD_DECLARATION_CLASS => {
+                let target = if args.action == action_id::ADD_DECLARATION_MATCHING_HEADER {
+                    DeclarationTarget::MatchingHeader
+                } else {
+                    DeclarationTarget::Class
+                };
+                let Some(generated) = add_declaration::add_declaration(
+                    &decl,
+                    args.position,
+                    target,
+                    header.as_ref(),
+                    &config,
+                ) else {
+                    self.show_info("No undeclared function definition at the cursor.")
+                        .await;
+                    return Ok(None);
+                };
+                add_generated(&mut changes, generated, &args.uri, other_uri.as_ref())
             }
             other => {
                 let Some(kind) = accessor_kind(other) else {
@@ -291,11 +324,11 @@ fn add_generated(
         changes.insert(uri.clone(), generated.edits);
     }
     let source_uri = source_uri?;
-    if !generated.source_edits.is_empty() {
-        changes.insert(source_uri.clone(), generated.source_edits);
+    if !generated.other_edits.is_empty() {
+        changes.insert(source_uri.clone(), generated.other_edits);
     }
     generated
-        .source_cursor
+        .other_cursor
         .map(|cursor| (source_uri.clone(), cursor))
 }
 
@@ -424,19 +457,21 @@ impl LanguageServer for Backend {
         if !crate::actions::may_offer_actions_at(&decl, position) {
             return Ok(None);
         }
-        let source_uri = match &path {
-            Some(path) if is_header => self.matching_source(path, &config).await,
-            _ => None,
+        let other_uri = match &path {
+            Some(path) => self.matching_file(path, &config).await,
+            None => None,
         };
-        let source_text = match &source_uri {
+        let other_text = match &other_uri {
             Some(uri) => self.file_text(uri).await,
             None => None,
         };
-        let source = source_text.as_ref().map(|s| FileInput {
+        let other = other_text.as_ref().map(|s| FileInput {
             text: &s.text,
-            is_header: false,
+            is_header: !is_header,
             is_c: s.is_c,
         });
+        let source = other.filter(|_| is_header);
+        let header = other.filter(|_| !is_header);
 
         let command_action = |title: &str, action: &str| {
             let args = ActionArgs {
@@ -533,6 +568,22 @@ impl LanguageServer for Backend {
             if let Some(generated) =
                 operators::generate_operators(&decl, position, action.kind, &config)
             {
+                actions.push(edit_action(&action.title, generated.edits));
+            }
+        }
+        for action in add_declaration::available_declarations(&decl, position, header.as_ref()) {
+            if action.edits_other_file {
+                actions.push(command_action(
+                    &action.title,
+                    declaration_action_id(action.target),
+                ));
+            } else if let Some(generated) = add_declaration::add_declaration(
+                &decl,
+                position,
+                action.target,
+                header.as_ref(),
+                &config,
+            ) {
                 actions.push(edit_action(&action.title, generated.edits));
             }
         }

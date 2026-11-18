@@ -3,8 +3,8 @@
 C/C++ refactorings for [Zed](https://zed.dev), ported from the
 [C-Mantic](https://github.com/BigBahss/vscode-cmantic) VS Code extension.
 
-> **Status: early development.** Add Definition, Generate Getters and Setters and
-> Generate Operators are implemented; the other refactorings are still being ported.
+> **Status: early development.** Add Definition, Add Declaration, Generate Getters and
+> Setters and Generate Operators are implemented; the other refactorings are still being ported.
 
 ## How it works
 
@@ -22,7 +22,7 @@ The Zed extension downloads `cmantic-ls` from this repo's GitHub releases and st
 | Add Definition (matching source file / this file / inline) | done |
 | Add all missing definitions (matching source file / this file) | done |
 | Generate Constructor with member initializers | done (all members, no picker) |
-| Add Declaration | planned |
+| Add Declaration (in class / matching header / this file) | done (always public) |
 | Generate Getters and Setters | done |
 | Generate equality, relational and stream output operators | done (all operands, inline) |
 | Add Header Guard, Add Include, Create Matching Source File | planned |
@@ -111,6 +111,43 @@ initializer). The cursor moves into the first new body when `revealNewDefinition
 
 C-Mantic shows a picker to choose functions and the target file; this port always adds all
 of them.
+
+## Add Declaration
+
+Put the cursor on the head of a function definition (its name, return type, parameters, ...
+but not its body) that has no declaration:
+
+- **Add Declaration in class "Foo"** (or `struct "Foo"`): for an out-of-class member
+  definition (`void Foo::bar() {}`) whose class is in this file or the matching header. The
+  declaration goes next to the declaration of a neighbouring definition when that one is
+  public, else after the last public member; a `public:` section is added if needed.
+- **Add Declaration in matching header file**: for a free function in a source file whose
+  matching header exists. It goes next to the declaration of a neighbouring definition,
+  else at the end of the matching `namespace` block, else after the last symbol. Namespaces
+  missing from the header are added around the declaration (`namespace b {` ... `}`).
+- **Add Declaration in this file**: for free functions, as a forward declaration next to the
+  declarations of neighbouring definitions, else before the first top-level symbol that uses
+  the function, else right before the definition.
+
+The declaration is the definition's head without the body: scope qualifiers the position is
+already inside are dropped (`Foo::`), as are default arguments and `inline`; `virtual`,
+`static` and the like can't be known and are not added. Template statements are kept
+(except those of the enclosing class template when declaring inside the class).
+
+Not offered for definitions inside a class body, when a declaration exists (in the class, in
+the matching header, or for "this file" in the file itself), for `main`, or when the class of
+a member definition can't be found.
+
+Differences from C-Mantic:
+
+- C-Mantic asks for the access specifier of a new member; Zed has no picker, so it is always
+  `public` (move it if needed). C-Mantic always uses the end of the public section; this port
+  prefers the neighbour's declaration.
+- `static` functions and functions in an anonymous namespace are only offered "in this file",
+  and their forward declaration keeps `static` (C-Mantic removes it, which doesn't compile).
+- "In this file" is placed before the first use. C-Mantic places it after the last symbol,
+  where it doesn't help.
+- Offered on the whole head of the definition, not only its name.
 
 ## Generate Getters and Setters
 

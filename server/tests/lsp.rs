@@ -646,3 +646,60 @@ async fn class_head_offers_bulk_and_operator_actions() {
         .await;
     assert_eq!(none, Some(Value::Null));
 }
+
+const DECL_HEADER: &str =
+    "#pragma once\n\nclass Foo {\npublic:\n    void a();\n};\n\nvoid free_a();\n";
+const DECL_SOURCE: &str = "#include \"foo.h\"\n\nvoid Foo::a() {}\n\nint Foo::b(int x) const { return x; }\n\nvoid free_a() {}\n\nvoid free_b() {}\n\nstatic void helper() {}\n";
+
+#[tokio::test]
+async fn add_declaration_in_class_and_matching_header() {
+    let mut h = Harness::new(
+        "add-declaration",
+        &[("foo.h", DECL_HEADER), ("foo.cpp", DECL_SOURCE)],
+    )
+    .await;
+    h.open("foo.cpp").await;
+    // Member definition: into the class in the header (a command).
+    let actions = h.actions("foo.cpp", 4, 9).await;
+    assert_eq!(titles(&actions), vec!["Add Declaration in class \"Foo\""]);
+    let sent = h.run(&actions[0]).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, "workspace/applyEdit");
+    let changes = sent[0].1["edit"]["changes"].as_object().unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        changes[&h.uri("foo.h")],
+        json!([{
+            "range": { "start": { "line": 4, "character": 13 }, "end": { "line": 4, "character": 13 } },
+            "newText": "\n    int b(int x) const;"
+        }])
+    );
+    // Free function: header or this file.
+    let actions = h.actions("foo.cpp", 8, 6).await;
+    assert_eq!(
+        titles(&actions),
+        vec![
+            "Add Declaration in matching header file",
+            "Add Declaration in this file"
+        ]
+    );
+    let sent = h
+        .run(find(&actions, "Add Declaration in matching header file"))
+        .await;
+    assert_eq!(
+        sent[0].1["edit"]["changes"][&h.uri("foo.h")][0]["newText"],
+        "\nvoid free_b();"
+    );
+    let this_file = find(&actions, "Add Declaration in this file");
+    assert!(this_file.get("command").is_none());
+    assert_eq!(
+        this_file["edit"]["changes"][&h.uri("foo.cpp")][0]["newText"],
+        "void free_b();\n\n"
+    );
+    // Declared already, or internal: nothing / only this file.
+    assert!(h.actions("foo.cpp", 6, 6).await.is_empty());
+    let actions = h.actions("foo.cpp", 10, 13).await;
+    assert_eq!(titles(&actions), vec!["Add Declaration in this file"]);
+    // Inside a body: nothing.
+    assert!(h.actions("foo.cpp", 4, 30).await.is_empty());
+}

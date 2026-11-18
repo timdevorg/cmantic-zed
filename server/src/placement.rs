@@ -19,7 +19,7 @@ pub struct ProposedPosition {
 }
 
 impl ProposedPosition {
-    fn after(offset: usize, relative_to: Option<usize>) -> Self {
+    pub fn after(offset: usize, relative_to: Option<usize>) -> Self {
         Self {
             offset,
             relative_to,
@@ -28,7 +28,7 @@ impl ProposedPosition {
         }
     }
 
-    fn before(offset: usize, relative_to: usize) -> Self {
+    pub fn before(offset: usize, relative_to: usize) -> Self {
         Self {
             offset,
             relative_to: Some(relative_to),
@@ -65,7 +65,8 @@ pub fn position_after_last_non_empty_line(text: &str) -> ProposedPosition {
     ProposedPosition::after(line_end(text, trimmed.len()), None)
 }
 
-fn position_after_last_symbol(text: &str, tree: &SymbolTree) -> ProposedPosition {
+/// After the last top-level symbol (`SourceDocument.positionAfterLastSymbol`).
+pub fn position_after_last_symbol(text: &str, tree: &SymbolTree) -> ProposedPosition {
     match tree.symbols.last() {
         Some(last) => {
             ProposedPosition::after(trailing_comment_end(text, last), Some(last.range.start))
