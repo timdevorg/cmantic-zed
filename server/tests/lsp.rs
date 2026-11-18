@@ -409,15 +409,17 @@ async fn add_all_missing_definitions_in_matching_source_file() {
 async fn add_all_missing_definitions_in_this_file() {
     let mut h = Harness::new("bulk-this", &[("foo.h", BULK_HEADER)]).await;
     h.open("foo.h").await;
-    // On a declaration, with other undefined declarations around.
+    // On a declaration: only the single Add Definition actions.
     let actions = h.actions("foo.h", 5, 10).await;
     assert_eq!(
         titles(&actions),
-        vec![
-            "Add Definition in this file",
-            "Add Definition inline",
-            "Add all missing definitions in this file"
-        ]
+        vec!["Add Definition in this file", "Add Definition inline"]
+    );
+    // On the class head.
+    let actions = h.actions("foo.h", 2, 7).await;
+    assert_eq!(
+        titles(&actions),
+        vec!["Add all missing definitions in this file"]
     );
     let sent = h
         .run(find(&actions, "Add all missing definitions in this file"))
@@ -451,16 +453,15 @@ async fn generate_constructor_initializing_all_members() {
             "Add Definition inline",
             "Generate Constructor in matching source file (initialize all members)",
             "Generate Constructor in this file (initialize all members)",
-            "Generate Constructor inline (initialize all members)",
         ]
     );
-    let inline = find(
+    let this_file = find(
         &actions,
-        "Generate Constructor inline (initialize all members)",
+        "Generate Constructor in this file (initialize all members)",
     );
     assert_eq!(
-        inline["edit"]["changes"][&h.uri("p.h")][0]["newText"],
-        "\n        : Base(),\n          a(),\n          b()\n    {\n        \n    }"
+        this_file["edit"]["changes"][&h.uri("p.h")][0]["newText"],
+        "\n\ninline P::P(int x)\n    : Base(),\n      a(),\n      b()\n{\n    \n}"
     );
     let sent = h
         .run(find(

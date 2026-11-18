@@ -142,14 +142,6 @@ fn bulk_constructors_initialize_required_members() {
 
 #[test]
 fn bulk_not_offered() {
-    // A single undefined declaration: the single Add Definition actions cover it.
-    assert!(
-        bulk_targets(
-            "struct S {\n    void a@();\n    void b() {}\n};\n",
-            Some("")
-        )
-        .is_empty()
-    );
     // Inside a class body but not on a declaration.
     assert!(
         bulk_targets(
@@ -176,9 +168,11 @@ fn bulk_not_offered() {
 }
 
 #[test]
-fn bulk_on_declaration_with_others_undefined() {
+fn bulk_not_offered_on_declarations() {
+    // Only the class head offers "Add all missing definitions", to keep the menu short.
+    assert!(bulk_targets("struct S {\n    void a@();\n    void b();\n};\n", None).is_empty());
     assert_eq!(
-        bulk_targets("struct S {\n    void a@();\n    void b();\n};\n", None),
+        bulk_targets("struct S@ {\n    void a();\n    void b();\n};\n", None),
         vec![BulkTarget::CurrentFile]
     );
 }

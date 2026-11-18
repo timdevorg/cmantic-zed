@@ -406,18 +406,18 @@ impl LanguageServer for Backend {
         let constructor =
             !targets.is_empty() && add_definition::offers_constructor_initializers(&decl, position);
         let mut actions = Vec::new();
-        for (initializers, title_of) in [
-            (
-                Initializers::None,
-                Target::title as fn(Target) -> &'static str,
-            ),
-            (Initializers::All, Target::constructor_title),
-        ] {
+        for initializers in [Initializers::None, Initializers::All] {
             if initializers == Initializers::All && !constructor {
                 continue;
             }
             for &target in &targets {
-                let title = title_of(target);
+                let title = match initializers {
+                    Initializers::All => match target.constructor_title() {
+                        Some(title) => title,
+                        None => continue,
+                    },
+                    _ => target.title(),
+                };
                 match target {
                     Target::MatchingSource => {
                         let id = if initializers == Initializers::All {

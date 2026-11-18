@@ -72,8 +72,8 @@ definition already exists in the file or its matching source file.
 ### Constructors
 
 On a constructor declaration of a class with base classes or non-static data members, the
-menu additionally offers **Generate Constructor in matching source file / in this file /
-inline (initialize all members)**. They add a member initializer list with every base class
+menu additionally offers **Generate Constructor in matching source file / in this file
+(initialize all members)**. They add a member initializer list with every base class
 followed by every non-static data member, in declaration order, and put the cursor in the
 first initializer:
 
@@ -89,7 +89,8 @@ Foo::Foo(int x)
 `cpp.bracedInitialization` switches `()` to `{}`. C-Mantic instead asks which initializers
 to use (including a delegating constructor); Zed has no multi-select picker, so this port
 always initializes everything (delete what you don't need). The plain Add Definition actions
-still give constructors an empty body.
+still give constructors an empty body. There is no inline variant, to keep the menu short:
+use **Add Definition inline** and write the initializers in place.
 
 ## Add all missing definitions
 
@@ -101,8 +102,8 @@ Adds definitions for every function declaration in the file that has none, in on
 - **Add all missing definitions in this file**.
 
 Offered when the cursor is on a class or struct head (its name, base list, ... but not its
-body) and the file has at least one undefined declaration, or on an undefined declaration
-when the file has at least two (for a single one, the Add Definition actions do the same).
+body) and the file has at least one undefined declaration. Not offered on individual
+declarations, to keep the menu there short.
 Definitions are added in declaration order and placed like single ones, so a definition
 follows the one just added for the previous declaration. Constructors get initializers only
 for members that require them (references and `const` members without a default member

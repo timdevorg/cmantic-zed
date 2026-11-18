@@ -22,7 +22,6 @@ pub const TITLE_CTOR_MATCHING_SOURCE: &str =
     "Generate Constructor in matching source file (initialize all members)";
 pub const TITLE_CTOR_CURRENT_FILE: &str =
     "Generate Constructor in this file (initialize all members)";
-pub const TITLE_CTOR_INLINE: &str = "Generate Constructor inline (initialize all members)";
 
 /// A file taking part in the refactoring.
 #[derive(Debug, Clone, Copy)]
@@ -52,12 +51,13 @@ impl Target {
         }
     }
 
-    /// Title of the "Generate Constructor (initialize all members)" variant.
-    pub fn constructor_title(self) -> &'static str {
+    /// Title of the "Generate Constructor (initialize all members)" variant. Not offered
+    /// inline (the declaration is right there to edit; it would only add menu clutter).
+    pub fn constructor_title(self) -> Option<&'static str> {
         match self {
-            Self::MatchingSource => TITLE_CTOR_MATCHING_SOURCE,
-            Self::CurrentFile => TITLE_CTOR_CURRENT_FILE,
-            Self::Inline => TITLE_CTOR_INLINE,
+            Self::MatchingSource => Some(TITLE_CTOR_MATCHING_SOURCE),
+            Self::CurrentFile => Some(TITLE_CTOR_CURRENT_FILE),
+            Self::Inline => None,
         }
     }
 }
@@ -141,8 +141,7 @@ pub fn may_offer_actions_at(decl: &FileInput, position: Position) -> bool {
     let offset = position_to_offset(decl.text, position);
     tree.symbol_at(offset).is_some_and(|path| {
         let symbol = path.symbol();
-        symbol.is_function_declaration()
-            || symbol.class.is_some() && symbol.body.as_ref().is_some_and(|b| offset <= b.start)
+        symbol.is_function_declaration() || is_on_class_head(symbol, offset)
     })
 }
 
@@ -476,8 +475,8 @@ fn definition_text(
 /// Whether "Add all missing definitions" can be offered at `position`, and for which targets.
 ///
 /// Offered when the cursor is on a class/struct head (outside its body) and the file has at
-/// least one undefined function declaration, or on an undefined declaration when the file has
-/// at least two (with one, the single Add Definition actions do the same).
+/// least one undefined function declaration. Not offered on individual declarations, to keep
+/// the menu short there.
 pub fn available_bulk_targets(
     decl: &FileInput,
     position: Position,
@@ -488,10 +487,7 @@ pub fn available_bulk_targets(
     let Some(at) = tree.symbol_at(offset) else {
         return Vec::new();
     };
-    let at = at.symbol();
-    let on_class_head = at.class.is_some() && at.body.as_ref().is_some_and(|b| offset <= b.start);
-    let on_declaration = at.is_function_declaration();
-    if !on_class_head && !on_declaration {
+    if !is_on_class_head(at.symbol(), offset) {
         return Vec::new();
     }
     let source_tree = matching_source.map(|s| SymbolTree::new(s.text));
@@ -499,8 +495,7 @@ pub fn available_bulk_targets(
         .into_iter()
         .filter(|p| !has_definition(p.symbol(), &tree, source_tree.as_ref()))
         .collect();
-    let needed = if on_class_head { 1 } else { 2 };
-    if undefined.len() < needed {
+    if undefined.is_empty() {
         return Vec::new();
     }
     let mut targets = Vec::new();
@@ -514,6 +509,11 @@ pub fn available_bulk_targets(
     }
     targets.push(BulkTarget::CurrentFile);
     targets
+}
+
+/// Whether `offset` is on the head of class `symbol` (its name, base list, ... but not its body).
+pub fn is_on_class_head(symbol: &Symbol, offset: usize) -> bool {
+    symbol.class.is_some() && symbol.body.as_ref().is_some_and(|b| offset <= b.start)
 }
 
 /// Adds definitions for all function declarations of `decl` that have none, in declaration
