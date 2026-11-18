@@ -83,13 +83,22 @@ pub fn detect_eol(text: &str) -> &'static str {
 
 /// Guesses one level of indentation from the file's contents.
 ///
-/// Returns `"\t"` if indented lines mostly start with tabs, otherwise the most common
-/// positive increase in leading spaces between consecutive non-blank lines.
+/// Returns `"\t"` if indented lines mostly start with tabs. Otherwise returns the most common
+/// increase in leading spaces after a line that opens a block (ends with `{`) or is an access
+/// specifier or case label. Other increases (aligned continuation lines such as member
+/// initializer lists or multi-line parameter lists) are only used when there are no such
+/// lines at all.
 pub fn detect_indentation(text: &str) -> Option<String> {
     let mut tabs = 0usize;
     let mut spaces = 0usize;
+    // Increases after a block opener, and between any two consecutive lines (fallback).
+    let mut block_deltas = [0usize; 9];
     let mut deltas = [0usize; 9];
     let mut previous = 0usize;
+    // Indentation of the previous code line, if it opens a block.
+    let mut opener: Option<usize> = None;
+    // Whether the previous code line is continued on the next one (ends with `,` or `(`).
+    let mut continues = false;
     let mut in_block_comment = false;
     for line in text.lines() {
         let trimmed = line.trim_start();
@@ -103,22 +112,41 @@ pub fn detect_indentation(text: &str) -> Option<String> {
             }
             continue;
         }
+        let comment_only = trimmed.starts_with("//") || trimmed.starts_with("/*");
         if trimmed.starts_with("/*") && !trimmed.contains("*/") {
             in_block_comment = true;
         }
         let indent = leading_whitespace(line);
         if indent.starts_with('\t') {
             tabs += 1;
+            if !comment_only {
+                opener = None;
+                continues = false;
+            }
             continue;
         }
         let width = indent.len();
         if !indent.is_empty() {
             spaces += 1;
         }
-        if width > previous && width - previous <= 8 {
+        let continuation = continues
+            || trimmed.starts_with(':') && !trimmed.starts_with("::")
+            || trimmed.starts_with(',');
+        if width > previous && width - previous <= 8 && !continuation {
             deltas[width - previous] += 1;
         }
+        if let Some(base) = opener
+            && width > base
+            && width - base <= 8
+        {
+            block_deltas[width - base] += 1;
+        }
         previous = width;
+        if !comment_only {
+            opener = opens_block(trimmed).then_some(width);
+            let code = strip_trailing_comment(trimmed);
+            continues = code.ends_with([',', '(']) || code.ends_with("&&") || code.ends_with("||");
+        }
     }
     if tabs == 0 && spaces == 0 {
         return None;
@@ -126,12 +154,48 @@ pub fn detect_indentation(text: &str) -> Option<String> {
     if tabs > spaces {
         return Some("\t".into());
     }
-    let (width, count) = deltas
-        .iter()
-        .enumerate()
-        .skip(1)
-        .max_by_key(|&(width, count)| (*count, std::cmp::Reverse(width)))?;
-    (*count > 0).then(|| " ".repeat(width))
+    let most_common = |deltas: &[usize; 9]| {
+        deltas
+            .iter()
+            .enumerate()
+            .skip(1)
+            .max_by_key(|&(width, count)| (*count, std::cmp::Reverse(width)))
+            .filter(|(_, count)| **count > 0)
+            .map(|(width, _)| " ".repeat(width))
+    };
+    most_common(&block_deltas).or_else(|| most_common(&deltas))
+}
+
+/// A code line without a trailing `//` or `/* */` comment and trailing whitespace.
+fn strip_trailing_comment(line: &str) -> &str {
+    let code = line.find("//").map_or(line, |i| &line[..i]);
+    let mut code = code.trim_end();
+    while code.ends_with("*/") {
+        match code.rfind("/*") {
+            Some(i) => code = code[..i].trim_end(),
+            None => break,
+        }
+    }
+    code
+}
+
+/// Whether a (left-trimmed) code line is followed by indented content: it ends with `{`, or
+/// is an access specifier or a case label. Trailing comments are ignored.
+fn opens_block(line: &str) -> bool {
+    let code = strip_trailing_comment(line);
+    if code.ends_with('{') {
+        return true;
+    }
+    let Some(label) = code.strip_suffix(':') else {
+        return false;
+    };
+    if label.ends_with(':') {
+        return false;
+    }
+    let label = label.trim_end();
+    matches!(label, "public" | "protected" | "private" | "default")
+        || label.starts_with("case ")
+        || label.starts_with("case(")
 }
 
 /// Whether `c` can be part of a C++ identifier.
@@ -234,6 +298,43 @@ mod tests {
         );
         assert_eq!(detect_indentation("a {\n\tb\n}\n").as_deref(), Some("\t"));
         assert_eq!(detect_indentation("a\nb\n"), None);
+    }
+
+    #[test]
+    fn aligned_continuation_lines_do_not_count() {
+        // Only empty bodies plus an aligned member initializer list: nothing to go by.
+        let empty = "Foo::Foo()\n    : Base(),\n      m_width()\n{\n}\n\nvoid Foo::f()\n{\n}\n";
+        assert_eq!(detect_indentation(empty), None);
+        let ctor = "Foo::Foo()\n    : Base(),\n      m_width(),\n      m_height()\n{\n}\n\nvoid Foo::f()\n{\n}\n\nvoid Foo::g() {\n    x();\n}\n";
+        assert_eq!(detect_indentation(ctor).as_deref(), Some("    "));
+        // Aligned multi-line parameter lists.
+        let params = "void f(int a,\n       int b,\n       int c);\nvoid g(int a,\n       int b);\nstruct S {\n    int x;\n};\n";
+        assert_eq!(detect_indentation(params).as_deref(), Some("    "));
+        // Access specifiers and case labels open a level too.
+        let labels = "class A {\npublic:\n  int x;\n};\nswitch (x) {\ncase 1:\n  break;\ndefault: // d\n  break;\n}\n";
+        assert_eq!(detect_indentation(labels).as_deref(), Some("  "));
+        // Trailing comments after `{` are ignored.
+        let comment = "void f() { // c\n  a(b,\n    c);\n}\nvoid g() { /* c */\n  x;\n}\n";
+        assert_eq!(detect_indentation(comment).as_deref(), Some("  "));
+    }
+
+    #[test]
+    fn indentation_fallbacks() {
+        // 2-space projects are still 2.
+        let two = "namespace n {\nclass A {\n  void f() {\n    if (x) {\n      y(a,\n        b);\n    }\n  }\n};\n}\n";
+        assert_eq!(detect_indentation(two).as_deref(), Some("  "));
+        // Tabs, even with aligned continuation lines.
+        let tabs = "void f()\n{\n\tg(a,\n\t  b);\n\th();\n}\n";
+        assert_eq!(detect_indentation(tabs).as_deref(), Some("\t"));
+        // No block openers at all: other increases count, except continuation lines.
+        assert_eq!(
+            detect_indentation("int a =\n   1;\nint b =\n   2;\n").as_deref(),
+            Some("   ")
+        );
+        assert_eq!(detect_indentation("void f(int a,\n       int b);\n"), None);
+        // A comment line between `{` and the body doesn't hide the opener.
+        let commented = "void f() {\n    // c\n    x;\n}\n";
+        assert_eq!(detect_indentation(commented).as_deref(), Some("    "));
     }
 
     #[test]

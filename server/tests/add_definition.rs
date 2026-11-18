@@ -573,3 +573,15 @@ fn explicit_class_template_specialization_member() {
         "void W<int>::special(int x) {\n    @\n}\n"
     );
 }
+
+#[test]
+fn aligned_initializer_list_does_not_change_indentation() {
+    // The source has only empty bodies and an aligned initializer list; the header's 4 spaces win.
+    let header =
+        "struct S : Base {\n    S();\n    void f();\n    void g@();\n    int m_width;\n};\n";
+    let source = "S::S()\n    : Base(),\n      m_width()\n{\n}\n\nvoid S::f() {\n}\n";
+    assert_eq!(
+        Case::new(header).source(source).run(Target::MatchingSource),
+        "S::S()\n    : Base(),\n      m_width()\n{\n}\n\nvoid S::f() {\n}\n\nvoid S::g() {\n    @\n}\n"
+    );
+}

@@ -248,7 +248,9 @@ Server settings go under `lsp.cmantic.settings` (the same keys are accepted in
 | `caseStyle` | Naming of generated getters and setters: `"camelCase"`, `"snake_case"` or `"PascalCase"`. |
 | `revealNewDefinition` | After adding a definition to the matching source file, or adding all missing definitions, open the file with the cursor in the (first) new body. Also used for getters/setters defined in the matching source file. |
 
-Indentation is detected from the file being edited (4 spaces if it has none).
+Indentation is detected from the file being edited, from the lines that follow a `{`, an access
+specifier or a case label (so aligned initializer lists and parameter lists are ignored). If the
+file has none, the other file of the refactoring or 4 spaces is used.
 
 ## Development
 
