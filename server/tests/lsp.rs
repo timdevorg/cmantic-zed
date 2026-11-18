@@ -386,8 +386,8 @@ async fn add_all_missing_definitions_in_matching_source_file() {
     // On the class name.
     let actions = h.actions("foo.h", 2, 7).await;
     assert_eq!(
-        titles(&actions),
-        vec![
+        titles(&actions)[..2],
+        [
             "Add all missing definitions in matching source file",
             "Add all missing definitions in this file"
         ]
@@ -429,8 +429,13 @@ async fn add_all_missing_definitions_in_this_file() {
     // On the class head.
     let actions = h.actions("foo.h", 2, 7).await;
     assert_eq!(
-        titles(&actions),
-        vec!["Add all missing definitions in this file"]
+        titles(&actions)[0],
+        "Add all missing definitions in this file"
+    );
+    assert!(
+        titles(&actions)[1..]
+            .iter()
+            .all(|t| t.starts_with("Generate "))
     );
     let sent = h
         .run(find(&actions, "Add all missing definitions in this file"))
@@ -600,4 +605,44 @@ async fn generate_accessors_falls_back_below_class_without_source_file() {
         getter["edit"]["changes"][&h.uri("foo.h")][1]["newText"],
         "\n\ninline int Foo::count() const {\n    return m_count;\n}"
     );
+}
+
+#[tokio::test]
+async fn class_head_offers_bulk_and_operator_actions() {
+    let mut h = Harness::new("operators", &[("foo.h", ACCESSOR_HEADER)]).await;
+    h.open("foo.h").await;
+    let actions = h.actions("foo.h", 2, 7).await;
+    assert_eq!(
+        titles(&actions),
+        vec![
+            "Add all missing definitions in this file",
+            "Generate Equality Operators for \"Foo\"",
+            "Generate Relational Operators for \"Foo\"",
+            "Generate Stream Output Operator for \"Foo\""
+        ]
+    );
+    // Operators are defined inline: plain edits.
+    let equality = find(&actions, "Generate Equality Operators for \"Foo\"");
+    assert!(equality.get("command").is_none());
+    assert_eq!(
+        equality["edit"]["changes"][&h.uri("foo.h")],
+        json!([{
+            "range": { "start": { "line": 4, "character": 10 }, "end": { "line": 4, "character": 10 } },
+            "newText": "\n    bool operator==(const Foo &other) const { return m_count == other.m_count; }\n    bool operator!=(const Foo &other) const { return !(*this == other); }"
+        }])
+    );
+    // A `refactor.extract` request gets nothing.
+    let uri = h.uri("foo.h");
+    let position = json!({ "line": 2, "character": 7 });
+    let none = h
+        .request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": uri },
+                "range": { "start": position, "end": position },
+                "context": { "diagnostics": [], "only": ["refactor.extract"] }
+            }),
+        )
+        .await;
+    assert_eq!(none, Some(Value::Null));
 }

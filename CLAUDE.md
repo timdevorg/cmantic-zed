@@ -37,16 +37,20 @@ Port of the C-Mantic VS Code extension to Zed, as a language server plus a thin 
     `finish()` gives a `GeneratedEdit` (edits for the header and the source file, source cursor).
   - `actions/accessors.rs`: Generate Getter/Setter (`Accessor.ts`, naming from `CSymbol.ts`), built on
     `ClassEditor`. Types judged by syntax only (`VariableInfo::leading_text`).
+  - `actions/operators.rs`: Generate Equality / Relational / Stream Output Operators (`Operator.ts`),
+    inline only, all base classes + non-static members as operands, built on `ClassEditor`.
   - `actions/mod.rs`: `may_offer_actions_at`, the cheap gate in `code_action`.
   - `server.rs`: LSP wiring. Actions that edit another file or need a cursor move are commands:
     `cmantic.applyAction` with `{uri, position, action}` (ids in `server::action_id`); executing it
     recomputes the action, sends `workspace/applyEdit`, then `window/showDocument` (one applyEdit may change the header and its source file). The older
     `cmantic.addDefinitionInSourceFile` is still accepted. Same-file single edits carry an `edit`.
-  - Tests: `server/tests/add_definition.rs`, `add_definitions.rs`, `accessors.rs` (fixtures, `@` = cursor, plus an
+  - Tests: `server/tests/add_definition.rs`, `add_definitions.rs`, `accessors.rs`, `operators.rs` (fixtures, `@` = cursor, plus an
     every-offset no-panic test), `header_source.rs` (temp dirs), `lsp.rs` (end-to-end through
     `LspService`; `Harness` sets up a temp project and a fake client that records applyEdit/showDocument).
 - `reference/vscode-cmantic/`: original C-Mantic TypeScript source (MIT). Git-ignored, read-only reference.
-  `src/commands/addDefinition.ts`, `src/CSymbol.ts` and `src/SourceDocument.ts` hold the Add Definition logic.
+  `src/commands/addDefinition.ts`, `src/CSymbol.ts` and `src/SourceDocument.ts` hold the Add Definition logic;
+  `src/commands/generateGetterSetter.ts`, `src/Accessor.ts`, `src/commands/generateOperators.ts` and
+  `src/Operator.ts` the accessor and operator generation.
 
 ## Commands
 

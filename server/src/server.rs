@@ -13,6 +13,7 @@ use tower_lsp_server::{Client, LanguageServer};
 use crate::actions::accessors::{self, AccessorKind};
 use crate::actions::add_definition::{self, BulkTarget, FileInput, Initializers, Target};
 use crate::actions::member::GeneratedEdit;
+use crate::actions::operators;
 use crate::config::Config;
 use crate::document::Document;
 use crate::header_source::HeaderSourceCache;
@@ -524,6 +525,13 @@ impl LanguageServer for Backend {
                 ));
             } else if let Some(generated) =
                 accessors::generate_accessors(&decl, position, action.kind, None, &config)
+            {
+                actions.push(edit_action(&action.title, generated.edits));
+            }
+        }
+        for action in operators::available_operators(&decl, position) {
+            if let Some(generated) =
+                operators::generate_operators(&decl, position, action.kind, &config)
             {
                 actions.push(edit_action(&action.title, generated.edits));
             }

@@ -3,8 +3,8 @@
 C/C++ refactorings for [Zed](https://zed.dev), ported from the
 [C-Mantic](https://github.com/BigBahss/vscode-cmantic) VS Code extension.
 
-> **Status: early development.** Add Definition and Generate Getters and Setters are
-> implemented; the other refactorings are still being ported.
+> **Status: early development.** Add Definition, Generate Getters and Setters and
+> Generate Operators are implemented; the other refactorings are still being ported.
 
 ## How it works
 
@@ -24,7 +24,7 @@ The Zed extension downloads `cmantic-ls` from this repo's GitHub releases and st
 | Generate Constructor with member initializers | done (all members, no picker) |
 | Add Declaration | planned |
 | Generate Getters and Setters | done |
-| Generate equality, relational and stream output operators | planned |
+| Generate equality, relational and stream output operators | done (all operands, inline) |
 | Add Header Guard, Add Include, Create Matching Source File | planned |
 | Move Definition | planned |
 | Update Function Signature | planned |
@@ -161,6 +161,49 @@ Differences from C-Mantic:
   templates (C-Mantic would produce code that doesn't compile).
 - Also offered in source files, not only in headers.
 
+## Generate Operators
+
+On a class or struct head (its name, base list, ... but not its body):
+
+- **Generate Equality Operators for "Foo"**: `operator==` and `operator!=`.
+- **Generate Relational Operators for "Foo"**: `operator<`, `operator>`, `operator<=` and
+  `operator>=` (the last three in terms of `<`).
+- **Generate Stream Output Operator for "Foo"**: a `friend` `operator<<` for `std::ostream`.
+
+```cpp
+class Foo : public Base {
+public:
+    bool operator==(const Foo &other) const {
+        return static_cast<const Base &>(*this) == static_cast<const Base &>(other)
+            && a == other.a
+            && b == other.b;
+    }
+    bool operator!=(const Foo &other) const { return !(*this == other); }
+
+private:
+    int a;
+    std::string b;
+};
+```
+
+Operators the class already declares (as members or friends) are skipped, and the missing
+ones of a group are placed next to the existing ones; nothing is offered when all exist.
+`cpp.friendComparisonOperators` generates `friend bool operator==(const Foo &lhs, const Foo
+&rhs)` instead of member functions, and `cpp.useExplicitThisPointer` writes `this->a`.
+
+Differences from C-Mantic:
+
+- C-Mantic asks which base classes and members to use and where to define each operator.
+  Zed has no pickers, so all base classes and non-static data members are used, in
+  declaration order, and the operators are defined inline in the public section (a
+  `public:` section is added if needed). Edit the result to taste.
+- `operator<<` needs `<ostream>` (or `<iostream>`). C-Mantic adds `#include <ostream>`; this
+  port doesn't touch includes, so add it yourself if it's missing.
+- Base classes are cast with their full name (`static_cast<const ns::Base<int> &>`).
+- With no operands, `==` returns `true` and `<` returns `false` (C-Mantic leaves the body empty).
+- Not offered for unions or anonymous classes; operators declared outside the class (free
+  functions) aren't detected.
+
 ## Settings
 
 Server settings go under `lsp.cmantic.settings` (the same keys are accepted in
@@ -181,7 +224,8 @@ Server settings go under `lsp.cmantic.settings` (the same keys are accepted in
             "setterDefinitionLocation": "inline",
             "boolGetterIsPrefix": false
           },
-          "useExplicitThisPointer": false
+          "useExplicitThisPointer": false,
+          "friendComparisonOperators": false
         },
         "c": { "curlyBraceFormat": { "function": "newLine" } },
         "caseStyle": "camelCase",
@@ -199,7 +243,8 @@ Server settings go under `lsp.cmantic.settings` (the same keys are accepted in
 | `cpp.bracedInitialization` | Use `member{}` instead of `member()` in generated constructor initializer lists. |
 | `cpp.accessor.getterDefinitionLocation`, `cpp.accessor.setterDefinitionLocation` | Where new getters/setters are defined: `"inline"` (in the class), `"belowClass"` (declaration in the class, definition below it), or `"matchingSourceFile"` (falls back to `"belowClass"` without a matching source file or for class templates). C-Mantic's values (`"Generate definition inline"`, ...) are accepted too. |
 | `cpp.accessor.boolGetterIsPrefix` | Name getters of `bool` members `isX` instead of `getX`. |
-| `cpp.useExplicitThisPointer` | Write `this->member` in generated member functions. |
+| `cpp.useExplicitThisPointer` | Write `this->member` in generated member functions (getters, setters, operators). |
+| `cpp.friendComparisonOperators` | Generate comparison operators as `friend` functions taking `lhs` and `rhs` instead of member functions. |
 | `caseStyle` | Naming of generated getters and setters: `"camelCase"`, `"snake_case"` or `"PascalCase"`. |
 | `revealNewDefinition` | After adding a definition to the matching source file, or adding all missing definitions, open the file with the cursor in the (first) new body. Also used for getters/setters defined in the matching source file. |
 
