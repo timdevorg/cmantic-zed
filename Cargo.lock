@@ -80,9 +80,11 @@ dependencies = [
 name = "cmantic-ls"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "serde",
  "serde_json",
  "tokio",
+ "tower",
  "tower-lsp-server",
  "tree-sitter",
  "tree-sitter-cpp",
