@@ -6,6 +6,7 @@ pub mod add_definition;
 pub mod member;
 pub mod move_definition;
 pub mod operators;
+pub mod update_signature;
 
 use tower_lsp_server::ls_types::Position;
 

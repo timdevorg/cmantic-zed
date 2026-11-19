@@ -16,9 +16,11 @@ use crate::actions::add_definition::{self, BulkTarget, FileInput, Initializers, 
 use crate::actions::member::GeneratedEdit;
 use crate::actions::move_definition::{self, MoveTarget};
 use crate::actions::operators;
+use crate::actions::update_signature::{SignatureUpdate, Tracker};
 use crate::config::Config;
 use crate::document::Document;
 use crate::header_source::HeaderSourceCache;
+use crate::text::position_to_offset;
 
 /// Command run by the "Add Definition in matching source file" code action.
 pub const COMMAND_ADD_DEFINITION_IN_SOURCE: &str = "cmantic.addDefinitionInSourceFile";
@@ -43,6 +45,7 @@ pub mod action_id {
     pub const MOVE_DEFINITION_MATCHING_HEADER: &str = "moveDefinition.matchingHeader";
     pub const MOVE_DEFINITION_INTO_CLASS: &str = "moveDefinition.intoClass";
     pub const MOVE_DEFINITION_OUT_OF_CLASS: &str = "moveDefinition.outOfClass";
+    pub const UPDATE_SIGNATURE: &str = "updateSignature";
 }
 
 fn move_action_id(target: MoveTarget) -> &'static str {
@@ -110,6 +113,8 @@ pub struct Backend {
     config: RwLock<Config>,
     roots: RwLock<Vec<PathBuf>>,
     header_source: Mutex<HeaderSourceCache>,
+    /// Pending "Update Function Signature" changes.
+    tracker: Mutex<Tracker>,
 }
 
 /// Text of a file plus whether it is C, read from the editor or from disk.
@@ -126,6 +131,7 @@ impl Backend {
             config: RwLock::new(Config::default()),
             roots: RwLock::new(Vec::new()),
             header_source: Mutex::new(HeaderSourceCache::default()),
+            tracker: Mutex::new(Tracker::default()),
         }
     }
 
@@ -157,8 +163,73 @@ impl Backend {
         Uri::from_file_path(found)
     }
 
+    /// The "Update Function Signature" action at `offset` of `uri`, if any.
+    async fn signature_update(
+        &self,
+        uri: &Uri,
+        text: &str,
+        offset: usize,
+    ) -> Option<SignatureUpdate> {
+        let uris = self.tracker.lock().await.counterpart_uris(uri);
+        if uris.is_empty() {
+            return None;
+        }
+        let mut files = HashMap::new();
+        for other in uris.into_iter().filter(|u| u != uri) {
+            if let Some(file) = self.file_text(&other).await {
+                files.insert(other, file.text);
+            }
+        }
+        self.tracker
+            .lock()
+            .await
+            .action_at(uri, text, offset, &files)
+    }
+
+    async fn run_update_signature(&self, args: ActionArgs) -> Result<Option<Value>> {
+        let Some(file) = self.file_text(&args.uri).await else {
+            return Ok(None);
+        };
+        let offset = position_to_offset(&file.text, args.position);
+        let Some(update) = self.signature_update(&args.uri, &file.text, offset).await else {
+            self.show_info("No changed function signature with a counterpart at the cursor.")
+                .await;
+            return Ok(None);
+        };
+        let edit = WorkspaceEdit {
+            changes: Some(HashMap::from([(
+                update.counterpart_uri.clone(),
+                update.edits,
+            )])),
+            ..Default::default()
+        };
+        let applied = self
+            .client
+            .apply_edit(edit)
+            .await
+            .is_ok_and(|response| response.applied);
+        if applied {
+            self.tracker.lock().await.remove(&args.uri, update.id);
+            if self.config.read().await.reveal_new_definition {
+                let _ = self
+                    .client
+                    .show_document(ShowDocumentParams {
+                        uri: update.counterpart_uri,
+                        external: Some(false),
+                        take_focus: Some(true),
+                        selection: Some(Range::new(update.cursor, update.cursor)),
+                    })
+                    .await;
+            }
+        }
+        Ok(None)
+    }
+
     /// Runs a command-based action (see [`action_id`]).
     async fn run_action(&self, args: ActionArgs) -> Result<Option<Value>> {
+        if args.action == action_id::UPDATE_SIGNATURE {
+            return self.run_update_signature(args).await;
+        }
         let config = self.config.read().await.clone();
         let invalid = |message: &str| Error::invalid_params(message.to_string());
         let path = args
@@ -357,6 +428,41 @@ impl Backend {
     }
 }
 
+impl Backend {
+    /// The code action for a [`SignatureUpdate`]: a plain edit in the same file, else a command.
+    fn update_action(
+        &self,
+        uri: &Uri,
+        position: Position,
+        update: SignatureUpdate,
+    ) -> CodeActionOrCommand {
+        let mut action = CodeAction {
+            title: update.title.clone(),
+            kind: Some(CodeActionKind::REFACTOR),
+            is_preferred: Some(true),
+            ..Default::default()
+        };
+        if update.counterpart_uri == *uri {
+            action.edit = Some(WorkspaceEdit {
+                changes: Some(HashMap::from([(uri.clone(), update.edits)])),
+                ..Default::default()
+            });
+        } else {
+            let args = ActionArgs {
+                uri: uri.clone(),
+                position,
+                action: action_id::UPDATE_SIGNATURE.into(),
+            };
+            action.command = Some(Command {
+                title: update.title,
+                command: COMMAND_APPLY_ACTION.into(),
+                arguments: Some(vec![serde_json::to_value(args).unwrap_or_default()]),
+            });
+        }
+        CodeActionOrCommand::CodeAction(action)
+    }
+}
+
 /// Adds a [`GeneratedEdit`] to `changes`; returns the cursor in the source file, if any.
 fn add_generated(
     changes: &mut HashMap<Uri, Vec<TextEdit>>,
@@ -462,16 +568,44 @@ impl LanguageServer for Backend {
         };
         let uri = params.text_document.uri;
         let version = params.text_document.version;
+        let config = self.config.read().await.clone();
+        let other_uri = match uri.to_file_path() {
+            Some(path) => self.matching_file(&path, &config).await,
+            None => None,
+        };
         let mut documents = self.documents.write().await;
-        match documents.get_mut(&uri) {
-            Some(doc) => doc.update(change.text, version),
-            None => {
-                documents.insert(uri, Document::new(change.text, version, "cpp".into()));
+        let old = match documents.get_mut(&uri) {
+            Some(doc) => {
+                let old = std::mem::take(&mut doc.text);
+                doc.update(change.text, version);
+                Some(old)
             }
-        }
+            None => {
+                documents.insert(
+                    uri.clone(),
+                    Document::new(change.text, version, "cpp".into()),
+                );
+                None
+            }
+        };
+        let Some(old) = old else { return };
+        let documents = &*documents;
+        let read_other = || {
+            let other = other_uri?;
+            let text = match documents.get(&other) {
+                Some(doc) => doc.text.clone(),
+                None => std::fs::read_to_string(other.to_file_path()?).ok()?,
+            };
+            Some((other, text))
+        };
+        self.tracker
+            .lock()
+            .await
+            .did_change(&uri, &old, &documents[&uri].text, read_other);
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        self.tracker.lock().await.close(&params.text_document.uri);
         self.documents
             .write()
             .await
@@ -498,8 +632,10 @@ impl LanguageServer for Backend {
             is_header,
             is_c: file.is_c,
         };
+        let offset = position_to_offset(&file.text, position);
+        let update = self.signature_update(&uri, &file.text, offset).await;
         if !crate::actions::may_offer_actions_at(&decl, position) {
-            return Ok(None);
+            return Ok(update.map(|u| vec![self.update_action(&uri, position, u)]));
         }
         let other_uri = match &path {
             Some(path) => self.matching_file(path, &config).await,
@@ -546,10 +682,13 @@ impl LanguageServer for Backend {
             })
         };
 
+        let mut actions = Vec::new();
+        if let Some(update) = update {
+            actions.push(self.update_action(&uri, position, update));
+        }
         let targets = add_definition::available_targets(&decl, position, source.as_ref());
         let constructor =
             !targets.is_empty() && add_definition::offers_constructor_initializers(&decl, position);
-        let mut actions = Vec::new();
         for initializers in [Initializers::None, Initializers::All] {
             if initializers == Initializers::All && !constructor {
                 continue;

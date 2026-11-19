@@ -27,7 +27,7 @@ The Zed extension downloads `cmantic-ls` from this repo's GitHub releases and st
 | Generate equality, relational and stream output operators | done (all operands, inline) |
 | Add Header Guard, Add Include, Create Matching Source File | planned |
 | Move Definition (matching source/header file, into/out of class) | done |
-| Update Function Signature | planned |
+| Update Function Signature | done |
 
 Switch Header/Source is already provided by Zed and clangd.
 
@@ -284,6 +284,52 @@ Differences from C-Mantic:
 - Not offered for unions or anonymous classes; operators declared outside the class (free
   functions) aren't detected.
 
+## Update Function Signature
+
+Edit the head of a function declaration or definition that has a counterpart (its definition
+or declaration, in the same file or the matching header/source file, open or not). Then, with
+the cursor on that function, cmd-. offers **Update Function Signature** (or **Update Function
+Signature in "foo.cpp"** when the counterpart is in another file), which rewrites the
+counterpart's head to match:
+
+- return type and leading specifiers such as `constexpr` or `[[nodiscard]]`
+- the name (the counterpart's `Foo::` qualifiers and template prefix stay as they are)
+- the parameters: added, removed, renamed, reordered or with new types
+- `const`, `volatile`, `&`/`&&`, `noexcept` and trailing return types
+
+```cpp
+// foo.h: edited from `int get(int32_t a, int b = 2);`
+long fetch(float a, int b = 2, bool strict = false) const;
+// foo.cpp: before                   after
+int Foo::get(int32_t a, int b)       long Foo::fetch(float a, int b, bool strict) const
+```
+
+Rules:
+
+- Default arguments stay on the declaration (mapped to the corresponding parameters) and are
+  never copied to a definition.
+- `virtual`, `static`, `explicit`, `friend`, `inline`, `override` and `final` are never
+  copied; the counterpart keeps its own.
+- A definition keeps its own parameter names for parameters that correspond to one of its
+  existing parameters (matched by name, else by position), so its body never breaks. New
+  parameters get the edited side's names. A declaration takes the edited side's names.
+- The counterpart's line breaks are kept: with two or more parameters its separators are
+  reused, otherwise the edited side's line breaks are re-aligned.
+
+Differences from C-Mantic:
+
+- C-Mantic re-finds the changed function by name and loses it after bigger edits. This port
+  tracks each edited head by position: every change is reduced to one changed range and the
+  tracked ranges are mapped through it. So the suggestion survives renaming the function and
+  changing parameters, types and qualifiers all at once, broken syntax while typing, moving
+  the cursor away and edits elsewhere in the file. Several functions can be pending at once.
+- A pending change is dropped when it is applied, when the head is edited back to the
+  original, when the head is deleted, or when the counterpart can't be found anymore (it is
+  looked up again by its recorded text and by the original signature first). Edits of the
+  counterpart never produce a suggestion in the other direction.
+- Template parameter lists and scope qualifiers aren't propagated. With a new parameter
+  without a default after defaulted ones, the declaration may need fixing by hand.
+
 ## Settings
 
 Server settings go under `lsp.cmantic.settings` (the same keys are accepted in
@@ -327,7 +373,7 @@ Server settings go under `lsp.cmantic.settings` (the same keys are accepted in
 | `cpp.useExplicitThisPointer` | Write `this->member` in generated member functions (getters, setters, operators). |
 | `cpp.friendComparisonOperators` | Generate comparison operators as `friend` functions taking `lhs` and `rhs` instead of member functions. |
 | `caseStyle` | Naming of generated getters and setters: `"camelCase"`, `"snake_case"` or `"PascalCase"`. |
-| `revealNewDefinition` | After adding a definition to the matching source file, or adding all missing definitions, open the file with the cursor in the (first) new body. Also used for getters/setters defined in the matching source file, and to open the file a definition was moved to. |
+| `revealNewDefinition` | After adding a definition to the matching source file, or adding all missing definitions, open the file with the cursor in the (first) new body. Also used for getters/setters defined in the matching source file, to open the file a definition was moved to, and the counterpart after Update Function Signature. |
 | `alwaysMoveComments` | Move Definition moves leading comments with the definition even when a declaration is left behind. When `false`, they stay with the declaration. |
 
 Indentation is detected from the file being edited, from the lines that follow a `{`, an access

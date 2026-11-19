@@ -325,6 +325,21 @@ impl Harness {
         .await;
     }
 
+    async fn change(&mut self, path: &str, version: i32, text: &str) {
+        let uri = self.uri(path);
+        call(
+            &mut self.service,
+            notification(
+                "textDocument/didChange",
+                json!({
+                    "textDocument": { "uri": uri, "version": version },
+                    "contentChanges": [{ "text": text }]
+                }),
+            ),
+        )
+        .await;
+    }
+
     async fn actions(&mut self, path: &str, line: u32, character: u32) -> Vec<Value> {
         let uri = self.uri(path);
         let position = json!({ "line": line, "character": character });
@@ -819,4 +834,90 @@ async fn move_definition_between_files() {
     );
     assert_eq!(sent[1].0, "window/showDocument");
     assert_eq!(sent[1].1["uri"], json!(header_uri));
+}
+
+const SIG_HEADER: &str = "#pragma once\n\nclass Foo {\npublic:\n    virtual int get(int a, int b = 2) const;\n};\n\nvoid helper(int x);\n\ninline void helper(int x) {}\n";
+const SIG_SOURCE: &str =
+    "#include \"foo.h\"\n\nint Foo::get(int a, int b) const\n{\n    return a + b;\n}\n";
+
+#[tokio::test]
+async fn update_function_signature() {
+    let mut h = Harness::new(
+        "update-signature",
+        &[("foo.h", SIG_HEADER), ("foo.cpp", SIG_SOURCE)],
+    )
+    .await;
+    h.open("foo.h").await;
+    let header_uri = h.uri("foo.h");
+    let source_uri = h.uri("foo.cpp");
+
+    // Several edits: rename, broken syntax while typing, new parameter, type change, an edit
+    // elsewhere in the file and removed const.
+    let steps = [
+        SIG_HEADER.replace("int get(", "int fetch("),
+        SIG_HEADER.replace(
+            "int get(int a, int b = 2) const",
+            "int fetch(int a, int b = 2, ",
+        ),
+        SIG_HEADER.replace(
+            "int get(int a, int b = 2) const",
+            "long fetch(float a, int b = 2, bool c)",
+        ),
+        format!(
+            "// edited\n{}",
+            SIG_HEADER.replace(
+                "int get(int a, int b = 2) const",
+                "long fetch(float a, int b = 2, bool c)"
+            )
+        ),
+    ];
+    for (i, text) in steps.iter().enumerate() {
+        h.change("foo.h", i as i32 + 2, text).await;
+    }
+    // The cursor elsewhere: nothing to offer there.
+    let actions = h.actions("foo.h", 0, 0).await;
+    assert!(titles(&actions).iter().all(|t| !t.starts_with("Update")));
+
+    let actions = h.actions("foo.h", 5, 20).await;
+    let update = find(&actions, "Update Function Signature in \"foo.cpp\"");
+    assert_eq!(
+        titles(&actions)[0],
+        "Update Function Signature in \"foo.cpp\""
+    );
+    let sent = h.run(update).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[0].0, "workspace/applyEdit");
+    let changes = &sent[0].1["edit"]["changes"];
+    assert_eq!(changes.as_object().unwrap().len(), 1);
+    let edits: Vec<String> = changes[&source_uri]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["newText"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(edits, vec!["long ", "fetch", "float a, int b, bool c", ""]);
+    assert_eq!(sent[1].0, "window/showDocument");
+    assert_eq!(sent[1].1["uri"], json!(source_uri));
+    assert_eq!(
+        sent[1].1["selection"]["start"],
+        json!({ "line": 2, "character": 10 })
+    );
+    // Applied: no longer offered.
+    let actions = h.actions("foo.h", 5, 20).await;
+    assert!(titles(&actions).iter().all(|t| !t.starts_with("Update")));
+
+    // Same file: a plain edit.
+    let last = &steps[3];
+    let edited = last.replace("void helper(int x);", "void helper(const int& x);");
+    h.change("foo.h", 10, &edited).await;
+    let actions = h.actions("foo.h", 8, 8).await;
+    let update = find(&actions, "Update Function Signature");
+    assert!(update.get("command").is_none());
+    assert_eq!(
+        update["edit"]["changes"][&header_uri],
+        json!([{
+            "range": { "start": { "line": 10, "character": 19 }, "end": { "line": 10, "character": 24 } },
+            "newText": "const int& x"
+        }])
+    );
 }

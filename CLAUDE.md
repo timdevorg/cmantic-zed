@@ -53,13 +53,22 @@ Port of the C-Mantic VS Code extension to Zed, as a language server plus a thin 
     `ClassEditor`. Types judged by syntax only (`VariableInfo::leading_text`).
   - `actions/operators.rs`: Generate Equality / Relational / Stream Output Operators (`Operator.ts`),
     inline only, all base classes + non-static members as operands, built on `ClassEditor`.
-  - `actions/mod.rs`: `may_offer_actions_at`, the cheap gate in `code_action`.
+  - `actions/update_signature.rs`: Update Function Signature (`updateSignature.ts`). `Tracker` (in
+    `Backend`, fed by `did_change`) follows edited function heads by position: `diff` gives one
+    `TextChange` (common prefix/suffix), `TextChange::map_range` maps tracked ranges. A `Pending`
+    records the head range, the original `Signature` and the `Counterpart` (uri, head range, head
+    text); `action_at` re-finds the current head by overlap, re-locates the counterpart (by text,
+    then original signature) and rewrites only the changed parts of its head (`rewrite`).
+    Pendings whose counterpart is in sync are dropped, which prevents reverse suggestions.
+    Same-file counterpart: plain `edit`; other file: `cmantic.applyAction` with `updateSignature`.
+  - `actions/mod.rs`: `may_offer_actions_at`, the cheap gate in `code_action` (pending signature
+    updates are checked before it, so they are offered anywhere in the edited function).
   - `server.rs`: LSP wiring. Actions that edit another file or need a cursor move are commands:
     `cmantic.applyAction` with `{uri, position, action}` (ids in `server::action_id`); executing it
     recomputes the action (with `matching_file`: the source of a header or the header of a source
     file), sends `workspace/applyEdit`, then `window/showDocument` (one applyEdit may change the header and its source file). The older
     `cmantic.addDefinitionInSourceFile` is still accepted. Same-file single edits carry an `edit`.
-  - Tests: `server/tests/add_definition.rs`, `add_definitions.rs`, `add_declaration.rs`, `move_definition.rs`, `accessors.rs`, `operators.rs` (fixtures, `@` = cursor, plus an
+  - Tests: `server/tests/add_definition.rs`, `add_definitions.rs`, `add_declaration.rs`, `move_definition.rs`, `accessors.rs`, `operators.rs`, `update_signature.rs` (fixtures, `@` = cursor, plus an
     every-offset no-panic test), `header_source.rs` (temp dirs), `lsp.rs` (end-to-end through
     `LspService`; `Harness` sets up a temp project and a fake client that records applyEdit/showDocument).
 - `reference/vscode-cmantic/`: original C-Mantic TypeScript source (MIT). Git-ignored, read-only reference.
